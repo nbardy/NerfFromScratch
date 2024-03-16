@@ -20,7 +20,7 @@ class MLP(nn.Module):
                 nn.Linear(inner_dim, inner_dim), nn.ReLU(), nn.LayerNorm(inner_dim)
             )
 
-        self.intermediate_layers = nn.ModuleList([block() for _ in range(depth - 2)])
+        self.intermediate_layers = nn.ModuleList([block() for _ in range(depth - 1)])
 
         self.final_layer = nn.Linear(inner_dim, output_dim)
 
@@ -39,6 +39,12 @@ class GaussianFeatureMLP(nn.Module):
         )
         self.mlp = MLP(
             input_dim=num_features * 2, inner_dim=512, output_dim=output_dim, depth=5
+        )
+
+        # Print param count
+        print(
+            "Total Param Count: ",
+            sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
 
     def forward(self, x):
