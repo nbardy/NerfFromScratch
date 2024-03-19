@@ -19,9 +19,16 @@ import cv2
 import numpy as np
 
 from models import get_model
+from utils import get_default_device
+
+from models import MultiPathGaussianMLP
 
 
 camera_depth = 0.2
+
+near = 0.02
+far = 20.0
+num_samples_ray_samples = 10
 
 
 # What does this do?:
@@ -107,16 +114,18 @@ image_transform = transforms.Compose(
 )
 
 
-def load_video(filename):
+def load_video(filename, max_frames=100):
     cap = cv2.VideoCapture(filename)
     video_frames = []
-    while True:
+    frame_count = 0
+    while frame_count < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
         pil_frame = Image.fromarray(frame)
         video_frames.append(image_transform(pil_frame))
+        frame_count += 1
     cap.release()
     return video_frames, len(video_frames)
 
@@ -155,33 +164,109 @@ def loss(x, y):
     return loss(x, y)
 
 
-def get_default_device():
-    if torch.backends.mps.is_available():
-        # Apple Silicon GPU available
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        # NVIDIA GPU available
-        device = torch.device("cuda")
-    else:
-        # Default to CPU
-        device = torch.device("cpu")
+def sample_points_along_rays(ray_origins, ray_directions, near, far, num_samples):
+    # Use the device from ray_origins to ensure consistency
+    device = ray_origins.device
+    # Linearly spaced samples along each ray
+    depths = torch.linspace(near, far, num_samples, device=device)
+    depths = depths.expand(ray_origins.shape[0], num_samples)
 
-    print(f"Using device: {device}")
-    return device
+    # Perturb depths for each ray to sample points at irregular intervals
+    perturbations = torch.rand_like(depths) * (far - near) / num_samples
+    depths += perturbations
+
+    # Compute 3D positions of sampled points along each ray
+    ray_samples = (
+        ray_origins[:, None, :] + ray_directions[:, None, :] * depths[..., None]
+    )
+
+    return ray_samples, depths
 
 
-def train_video(video_path, epochs=5, n_points=5, n_frames=10):
+def compute_transmittance(alphas):
+    accumulated_transmittance = torch.cumprod(alphas, 1)
+    return torch.cat(
+        (
+            torch.ones((accumulated_transmittance.shape[0], 1), device=alphas.device),
+            accumulated_transmittance[:, :-1],
+        ),
+        dim=-1,
+    )
+
+
+# NOTE: Input timestep is for temporal time of the video
+#       the t_vals is many values along a ray
+def render_rays(
+    nerf_model,
+    ray_origins,
+    ray_directions,
+    timestep,
+    near=0.02,
+    far=20.0,
+    num_samples=192,
+):
+    device = ray_origins.device
+
+    # Sample points along each ray
+    t_vals = torch.linspace(near, far, num_samples, device=device).expand(
+        ray_origins.shape[0], num_samples
+    )
+    # Perturb sampling along each ray for stochastic sampling
+    mid = (t_vals[:, :-1] + t_vals[:, 1:]) / 2
+    lower = torch.cat((t_vals[:, :1], mid), -1)
+    upper = torch.cat((mid, t_vals[:, -1:]), -1)
+    u = torch.rand(t_vals.shape, device=device)
+    t_vals = lower + (upper - lower) * u  # Perturbed t values
+
+    # Compute deltas for transmittance calculation
+    delta = torch.cat(
+        (
+            t_vals[:, 1:] - t_vals[:, :-1],
+            torch.tensor([1e10], device=device).expand(ray_origins.shape[0], 1),
+        ),
+        -1,
+    )
+
+    # Compute 3D points along each ray
+    points = ray_origins[:, None, :] + ray_directions[:, None, :] * t_vals[..., None]
+
+    # Flatten points and directions for batch processing
+    flat_points = points.reshape(-1, 3)
+    flat_dirs = ray_directions.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 3)
+
+    # Query NeRF model for colors and densities
+    colors, densities = nerf_model(flat_points, flat_dirs, timestep)
+    colors = colors.view(points.shape)
+    densities = densities.view(points.shape[:-1])
+
+    # Compute alpha values and weights for color accumulation
+    alphas = 1 - torch.exp(-densities * delta)
+    weights = alphas * compute_transmittance(alphas)
+
+    # Accumulate colors along rays
+    accumulated_colors = (weights.unsqueeze(-1) * colors).sum(dim=1)
+
+    # Add background color
+    accumulated_colors += 1 - weights.sum(dim=1, keepdim=True)
+
+    return accumulated_colors
+
+
+def train_video(video_path, epochs=5, n_points=5, n_frames=10, max_frames=None):
+    assert max_frames is not None
     wandb.init(project="3D_nerf")
 
     camera_position = LearnableCameraPosition(n_frames=n_frames)
-    scene_function = get_model(args.model, input_dim=7)
+    # scene_function = get_model(args.model, input_dim=7)
+    scene_function = MultiPathGaussianMLP()
 
     optimizer = torch.optim.Adam(
         list(scene_function.parameters()) + list(camera_position.parameters()),
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     device = get_default_device()
     # Load and preprocess image on the correct device
-    video_frames, max_frames = load_video(video_path)
+    video_frames, max_frames = load_video(video_path, max_frames=max_frames)
     size = video_frames[0].shape
     size = [size[1], size[2]]
 
@@ -189,16 +274,19 @@ def train_video(video_path, epochs=5, n_points=5, n_frames=10):
     camera_position.to(device)
 
     for epoch in range(epochs):
-        print("Computing Epoch: ", epoch)
 
         # Create a batch of training data by taking a random set of frames
         # and sampling a random set of points from each frame
 
         # TODO: Make it repeat in a cycle to sample points evenly
-        random_frame_indices = torch.randint(0, n_frames, (n_points,))
+        random_frame_indices = torch.randint(0, len(video_frames), (n_frames,))
 
-        batch_input = []
+        # Accumulate samples over many frames
+        batch_camera_poses = []
+        batch_rays = []
+        batch_t = []
         batch_output = []
+
         for i in range(n_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=i)
 
@@ -210,22 +298,36 @@ def train_video(video_path, epochs=5, n_points=5, n_frames=10):
                 [random_frame, camera_poses, camera_rays], n_points, size
             )
 
+            batch_camera_poses.append(sampled_poses)
+            batch_rays.append(sampled_rays)
+            batch_output.append(sampled_colors)
+
             # Append timestep
             t = frame_index / max_frames
             t = torch.ones(n_points, 1) * t
             t = t.to(device)
-            input = torch.cat([sampled_poses, sampled_rays, t], dim=-1)
 
-            batch_input.append(input)
-            batch_output.append(sampled_colors)
+            batch_t.append(t)
 
         # Stack the batch
-        batch_input = torch.cat(batch_input, dim=0)
+        batch_camera_poses = torch.cat(batch_camera_poses, dim=0)
+        batch_rays = torch.cat(batch_rays, dim=0)
         batch_output = torch.cat(batch_output, dim=0)
+        batch_t = torch.cat(batch_t, dim=0)
 
         ##
         # Inference
-        generated_colors = scene_function(batch_input)
+        # generated_colors = scene_function(batch_input)
+
+        generated_colors = render_rays(
+            scene_function,
+            batch_camera_poses,
+            batch_rays,
+            batch_t,
+            near,
+            far,
+            num_samples_ray_samples,
+        )
 
         ##
         # Loss Calculation, Backpropagation, and Gradient Reset
@@ -233,45 +335,71 @@ def train_video(video_path, epochs=5, n_points=5, n_frames=10):
         loss_value = loss(generated_colors, batch_output)
         loss_value.backward()
         optimizer.step()
+        scheduler.step()
 
+        log_data = {}
         if epoch % args.validation_steps == 0:
-            # Generate a t for each point
-            total_points = size[0] * size[1]
-            t = int(0.5 * len(video_frames))
-            t_val = t
-            t = t_val / max_frames
-            t = torch.ones(total_points, 1) * t
-            t = t.to(device)
-
-            image = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)
-
-            gt_frame_index = t_val
-            gt_frame = video_frames[gt_frame_index]
-            wandb.log(
-                {
-                    "predicted": wandb.Image(image),
-                    "ground truth": wandb.Image(gt_frame),
-                    "image loss": loss_value,
-                }
-            )
-        elif epoch % args.video_validation_steps == 0:
-            frames = []
-            for i in range(5):
-                t = int(0.5 * len(video_frames)) / max_frames
-                t = t + i / max_frames
-                t = torch.ones(camera_poses.shape[0], 1) * t
-                t = t.to(device)
-
-                image = inference_nerf(
-                    scene_function, camera_poses, camera_rays, size, t=t
+            log_data.update(
+                log_image(
+                    scene_function,
+                    video_frames,
+                    camera_position,
+                    size,
+                    max_frames,
+                    device,
                 )
-                frames.append(np.array(image))
-
-            wandb.log(
-                {"video": wandb.Video(np.stack(frames, axis=0), fps=4, format="mp4")}
             )
-        else:
-            wandb.log({"image loss": loss_value})
+
+        # if epoch % args.video_validation_steps == 0:
+        #     log_data.update(
+        #         log_video(
+        #             scene_function,
+        #             video_frames,
+        #             camera_position,
+        #             size,
+        #             max_frames,
+        #             device,
+        #         )
+        #     )
+
+        log_data["image loss"] = loss_value
+        log_data["learning rate"] = scheduler.get_last_lr()[0]
+        wandb.log(log_data)
+
+
+def log_image(scene_function, video_frames, camera_position, size, max_frames, device):
+    log_data = {}
+    total_points = size[0] * size[1]
+    # First  frames
+    t_val = 0
+    t = torch.ones(total_points, 1) * (t_val / max_frames)
+    t = t.to(device)
+
+    camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=t_val)
+    image = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)
+    gt_frame = video_frames[t_val]
+
+    log_data["predicted"] = wandb.Image(image)
+    log_data["ground truth"] = wandb.Image(gt_frame)
+    return log_data
+
+
+def log_video(scene_function, video_frames, camera_position, size, max_frames, device):
+    log_data = {}
+    frames = []
+    for i in range(max_frames):
+        t = (int(0.5 * len(video_frames)) + i) / max_frames
+        t = torch.ones(size[0] * size[1], 1) * t
+        t = t.to(device)
+
+        camera_poses, camera_rays = camera_position.get_rays(
+            size=size, frame_idx=int(0.5 * len(video_frames)) + i
+        )
+        image = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)
+        frames.append(np.array(image))
+
+    log_data["video"] = wandb.Video(np.stack(frames, axis=0), fps=4, format="mp4")
+    return log_data
 
 
 def inference_nerf(
@@ -345,10 +473,16 @@ if __name__ == "__main__":
         help="Number of frames to sample from the video",
     )
     # validation sample rate
-    parser.add_argument("--validation_steps", type=int, default=10)
+    parser.add_argument("--validation_steps", type=int, default=40)
     parser.add_argument("--video_validation_steps", type=int, default=50)
     # Model = mlp, mlp-gauss
     parser.add_argument("--model", type=str, default="mlp", help="Model to use")
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=5,
+        help="Maximum number of frames to use for training and inference.",
+    )
 
     args = parser.parse_args()
 
@@ -367,4 +501,5 @@ if __name__ == "__main__":
         epochs=args.epochs,
         n_points=args.n_points,
         n_frames=args.n_frames,
+        max_frames=args.max_frames,
     )

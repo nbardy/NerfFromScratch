@@ -159,6 +159,7 @@ def train_single_image(image, epochs=5, n_points=5, size=[1600, 800]):
 
     optimizer = torch.optim.Adam(
         list(scene_function.parameters()) + list(camera_position.parameters()),
+        # lr=1e-4,
     )
     device = get_default_device()
     # Load and preprocess image on the correct device
@@ -191,7 +192,6 @@ def train_single_image(image, epochs=5, n_points=5, size=[1600, 800]):
 
         if epoch % args.validation_steps == 0:
             with torch.no_grad():
-                print("Running inference")
                 image = inference_nerf(scene_function, camera_poses, camera_rays, size)
 
                 wandb.log(

@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+from utils import get_default_device
+
 from torch.nn import functional as F
 
 
@@ -53,6 +55,64 @@ class GaussianFeatureMLP(nn.Module):
         return self.mlp(x_features)
 
 
+# This gaussian MLP has multiple paths for inputs to treat them differently
+#
+# For three inputs:
+#  1. 3D pos
+#  2. camera dir(3d vec)
+#  3. t(1d scalar)
+# For 1 let's use the gaussian encoding from above
+# For 2 We should leave it unencoded and we pass it in later in the final stage as input to the final linear projection from the feature dim
+#       to the output dim size we add the camera dir
+# For the t variable we append t to the features that we make from the np.pi cos/sin, we leave this un embedded
+class MultiPathGaussianMLP(nn.Module):
+    def __init__(
+        self,
+        pos_input_dim=3,
+        camera_dir_dim=3,
+        num_features=256,
+        sigma=10.0,
+        output_dim=4,
+    ):
+        super(MultiPathGaussianMLP, self).__init__()
+        # Gaussian encoding for 3D position
+        self.B_pos = nn.Parameter(
+            torch.randn(pos_input_dim, num_features) * sigma, requires_grad=False
+        )
+        # MLP for processing encoded position and time
+        size = num_features * 2 + 1
+
+        self.mlp = MLP(
+            input_dim=size,
+            inner_dim=size,
+            output_dim=size,
+            depth=5,
+        )
+
+        self.final_dense = nn.Linear(size + 3, size + 3)
+        self.final_layer = nn.Linear(size + 3, output_dim)
+
+    def forward(self, pos, dir, t):
+        # Gaussian encoding for position
+        pos_proj = (2.0 * np.pi * pos @ self.B_pos).float()
+        pos_features = torch.cat([torch.sin(pos_proj), torch.cos(pos_proj)], dim=-1)
+
+        print("======")
+        print("shapes")
+        print(pos_features.shape)
+        print(t)
+        print(t.shape)
+
+        features_with_time = torch.cat([pos_features, t], dim=-1)
+
+        x = self.mlp(features_with_time)
+        x = x.cat([x, dir], dim=-1)
+        x = self.final_dense(x)
+        x = self.final_layer(x)
+
+        return x
+
+
 def get_model(model_name, input_dim=6):
     if model_name == "mlp":
         return MLP(input_dim=input_dim, inner_dim=512, output_dim=3, depth=5)
@@ -68,18 +128,3 @@ def get_model(model_name, input_dim=6):
         )
     else:
         raise ValueError(f"Model {model_name} not found")
-
-
-def get_default_device():
-    if torch.backends.mps.is_available():
-        # Apple Silicon GPU available
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        # NVIDIA GPU available
-        device = torch.device("cuda")
-    else:
-        # Default to CPU
-        device = torch.device("cpu")
-
-    print(f"Using device: {device}")
-    return device
