@@ -38,10 +38,10 @@ Training Stability
 
 - [x] Add Loss term on foundation text model to speed up training and provide knowledge transfer from large foundation model pretrains
 
-Style(TODO)
+Style Controls
 
-- [ ] CLIP based pixel style loss
-- [ ] CLIP Based geometry style loss on depth maps
+- [x] CLIP based pixel style loss
+- [x] CLIP based geometry style loss on depth maps
 
 Training Speedups
 
