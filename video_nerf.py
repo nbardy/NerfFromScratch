@@ -157,7 +157,7 @@ def sample_indices(prob_dist, n_samples, total_pixels):
 
 
 def sample_n_points_from_tensors(
-    image_tensors, n_points, viewport_size, boost_edge=False
+    image_tensors, n_points, viewport_size, boost_edge=False, k_length_clusters=1
 ):
     total_pixels = viewport_size[0] * viewport_size[1]
     sampled_values = []
@@ -197,6 +197,24 @@ def sample_n_points_from_tensors(
         # Uniform sampling
         uniform_prob_dist = torch.ones(total_pixels) / total_pixels
         combined_indices = sample_indices(uniform_prob_dist, n_points, total_pixels)
+
+    # Cluster sampling
+    if k_length_clusters > 1:
+        cluster_indices = []
+        n_clusters = n_points // k_length_clusters
+        for _ in range(n_clusters):
+            start_index = torch.randint(
+                0, total_pixels - k_length_clusters + 1, (1,)
+            ).item()
+            cluster_indices.extend([start_index + i for i in range(k_length_clusters)])
+        if len(cluster_indices) < n_points:
+            additional_indices = torch.randint(
+                0, total_pixels, (n_points - len(cluster_indices),)
+            )
+            cluster_indices = torch.cat(
+                (torch.tensor(cluster_indices), additional_indices)
+            )
+        combined_indices = cluster_indices[:n_points]
 
     # Convert flat indices to 2D coordinates
     y_coords = combined_indices // viewport_size[1]
@@ -347,22 +365,24 @@ def compute_clip_loss(image_features, text_features):
     return loss
 
 
-def sample_with_scores(video_frames, differences, blur_scores, n_frames):
+def sample_with_scores(
+    video_frames, differences, blur_scores, n_frames, sample_clusters
+):
     """
-    Samples frames based on uniform random, differences maximized, and minimal blur scores.
-    Each criterion contributes 30% to the final sample set.
+    Samples frames based on uniform random, differences maximized, minimal blur scores, and clustered sampling.
+    Each criterion contributes 30% to the final sample set, except for clustered sampling which is determined by sample_clusters.
 
     :param video_frames: List of video frames.
     :param differences: List of difference scores between consecutive frames.
     :param blur_scores: List of blur scores for each frame.
     :param n_frames: Total number of frames to sample.
+    :param sample_clusters: Number of frames to sample in each cluster.
     :return: A list of sampled frames.
     """
     n_uniform = int(n_frames * 0.3)
     n_diff = int(n_frames * 0.3)
-    n_blur = (
-        n_frames - n_uniform - n_diff
-    )  # Ensures total is exactly n_frames even with rounding
+    n_blur = int(n_frames * 0.3)  # Ensures total is exactly n_frames even with rounding
+    n_cluster = n_frames - n_uniform - n_diff - n_blur
 
     # Uniform random sampling
     uniform_indices = torch.randperm(len(video_frames))[:n_uniform]
@@ -373,8 +393,20 @@ def sample_with_scores(video_frames, differences, blur_scores, n_frames):
     # Sampling based on minimal blur
     blur_indices = torch.argsort(torch.tensor(blur_scores))[:n_blur]
 
+    # Clustered sampling
+    cluster_indices = []
+    for _ in range(n_cluster // sample_clusters):
+        start_index = torch.randint(0, len(video_frames) - sample_clusters, (1,)).item()
+        for i in range(sample_clusters):
+            cluster_indices.append(start_index + i)
+    cluster_indices = torch.tensor(cluster_indices)[
+        :n_cluster
+    ]  # Ensure it does not exceed n_cluster
+
     # Combine and deduplicate indices
-    all_indices = torch.cat((uniform_indices, diff_indices, blur_indices))
+    all_indices = torch.cat(
+        (uniform_indices, diff_indices, blur_indices, cluster_indices)
+    )
     unique_indices = torch.unique(all_indices)
 
     # If deduplication leads to fewer frames, sample randomly to fill the gap
@@ -385,7 +417,7 @@ def sample_with_scores(video_frames, differences, blur_scores, n_frames):
         unique_indices = torch.unique(torch.cat((unique_indices, additional_indices)))
 
     # Select frames based on indices
-    sampled_frames = [video_frames[i] for i in unique_indices]
+    sampled_frames = [video_frames[i] for i in unique_indices.tolist()]
 
     return sampled_frames
 
@@ -428,7 +460,11 @@ def train_video(
 
     for epoch in range(epochs):
         sampled_frames = sample_with_scores(
-            video_frames, differences, blur_scores, n_frames
+            video_frames,
+            differences,
+            blur_scores,
+            n_frames,
+            sample_clusters=args.time_sample_clusters,
         )
         batch_camera_poses = []
         batch_rays = []
@@ -448,6 +484,7 @@ def train_video(
                     n_points,
                     size,
                     boost_edge=args.boost_edge,
+                    k_length_clusters=args.space_sample_cluster,
                 )
             )
 
@@ -794,6 +831,18 @@ if __name__ == "__main__":
         default="mse",
         choices=["mse", "huber"],
         help="Type of loss function to use for base loss.",
+    )
+    parser.add_argument(
+        "--space_sample_cluster",
+        type=int,
+        default=10,
+        help="Number of frames to sample in each cluster.",
+    )
+    parser.add_argument(
+        "--time_sample_clusters",
+        type=int,
+        default=3,
+        help="Number of frames to sample in each cluster.",
     )
 
     args = parser.parse_args()
