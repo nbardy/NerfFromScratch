@@ -12,6 +12,18 @@ train.py --video demo.mp4
 
 Allow training of a video NERF in 50-60 seconds that allows high quality video stylization
 
+Models
+
+- [x] Add spacetime lookup tables
+- [x] Explore Transformers instead of MLPs(NOTES: Data hungry and slow, is more smooth and better results with more compute)
+- [x] Add fast mobile transformer instead of MLP[In progess, code is in repo haven't tested on NERFs)(Probably ditch this in favor of lookup tables)
+- [x] Lookup table inspired by instantNGP
+
+Expand Spacetime Handling
+
+- [x] Add Space time geometry projection to project arbitrary scene geometry to cube based 3D lookup tables
+- [x] Lookup neighbors in lookup table for more scene information in space and time directions
+
 Video
 
 - [x] Add a timestep variable
@@ -22,21 +34,9 @@ Video
   - [x] Increase focus on edges within frames
   - [x] Favor frames with significant changes to minimize redundancy
 
-Expand Spacetime Handling
-
-- [x] Add Space time geometry projection to project arbitray scene geometry to 3D lookup table
-- [x] Lookup neighbors in lookup table for more scene information
-
-Models
-
-- [x] Add features from nerf follow up sin+cos
-- [x] Explore Transformers(NOTES: Data hungry and slow, is more smooth and better results with more compute)
-- [x] Add fast mobile transformer instead of MLP[In progess]
-- [x] Lookup table inspired by instantNGP
-
 Training Stability
 
-- [x] Add Loss term on foundation text model to speed up training and provide knowledge transfer from large foundation model pretrains
+- [x] Add Loss term on model estimated depth, This allows us to take advantage of a prerained foundation model and bootstrap training
 
 Style Controls
 

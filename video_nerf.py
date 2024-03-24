@@ -1,13 +1,7 @@
 ## This file impliments NERF's from scratch in pytorch
-
-# To implement a NERF(Neural Radiance Field) we impliment a model function that learns a scene representation
 #
-#
-# The model is a simple MLP that accepts a origin and direction vector,
-# where the origin is the position in a rectangular grid
-# and the direction is the line that goes through a pin hole origin
-#
-# This model is trained on an mp4 and learns a position for each frame
+# Impliments a pipeline to train a NERF from a mp4 video file with unknown camera parameters
+# and optionally to train a style LORA on top of the nerf with different geometry
 import torch
 import torch.nn as nn
 import wandb
@@ -26,10 +20,10 @@ from PIL import Image
 from models import get_model
 from utils import get_default_device
 from preprocess import blur_scores, video_difference_scores, deblur_video
-from peft import inject_adapter_in_model, LoraConfig, enable_adapters, disable_adapters
+from peft import inject_adapter_in_model, LoraConfig
 
 from depth import image_depth
-from style import embed_for_text, embed_for_image
+from style import embed_text, embed_image
 
 camera_depth = 0.2
 
@@ -304,24 +298,26 @@ def compute_style_loss(batch_output, depth_maps, args):
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Utilize provided utility functions for embedding extraction
-    image_embeds = embed_for_image(batch_output.to(device))
-    depth_map_embeds = embed_for_text(depth_maps.to(device))
+    image_embeds = embed_image(batch_output.to(device))  # [Batch, Seq_len, Emb_dim]
+    depth_map_embeds = embed_text(depth_maps.to(device))  # [Batch, Seq_len, Emb_dim]
 
     loss_dict = {}
     total_loss = 0.0
 
     # Process geometry style text prompts
     if args.geo_style_text:
-        geo_text_embeds = embed_for_text(
-            ["A depth map.", f"A depth map, {args.style_prompt}"], device
-        )
+        geo_text_embeds = embed_text(
+            ["A depth map.", f"A depth map, {args.style_prompt}"], device=device
+        )  # [Batch, Seq_len, Emb_dim]
         geo_loss = F.cross_entropy(geo_text_embeds, depth_map_embeds)
         total_loss += args.scale_geo * geo_loss
         loss_dict["geo_loss"] = geo_loss.item()
 
     # Process clip style text prompts
     if args.clip_style_text:
-        style_text_embeds = embed_for_text([args.clip_style_text], device)
+        style_text_embeds = embed_text(
+            [args.clip_style_text], device=device
+        )  # [Batch, Seq_len, Emb_dim]
         style_loss = F.cross_entropy(style_text_embeds, image_embeds)
         total_loss += args.scale_style * style_loss
         loss_dict["style_loss"] = style_loss.item()
@@ -553,7 +549,6 @@ def train_style_video(
     camera_position.to(device)
 
     for epoch in range(epochs):
-        enable_adapters(scene_function_with_lora)
         frame_index = 0  # Always use the first frame for style training
         frame = video_frames[frame_index].to(device)
         frame = torch.nn.functional.interpolate(
