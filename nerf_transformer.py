@@ -1,9 +1,8 @@
 # This impliments a NERF transformer
-# A mostly standard transformer that uses feature embeddings
-# to work for small inputs
 
 # This experiment was moderately successful but classic transofrmers are too
-# hungry for data(making them great for LLMs but bad NERFs
+# hungry for data(making them great for LLMs but bad NERFs, if you are willing to wait it trains better than the MLP, but 
+# You can go much faster with lookup tables. This is the wrong application of transformers.
 
 # Will move to instantNGP + MLP and try mobilenet.
 # for NLP replacement
