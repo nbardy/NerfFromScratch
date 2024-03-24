@@ -347,6 +347,49 @@ def compute_clip_loss(image_features, text_features):
     return loss
 
 
+def sample_with_scores(video_frames, differences, blur_scores, n_frames):
+    """
+    Samples frames based on uniform random, differences maximized, and minimal blur scores.
+    Each criterion contributes 30% to the final sample set.
+
+    :param video_frames: List of video frames.
+    :param differences: List of difference scores between consecutive frames.
+    :param blur_scores: List of blur scores for each frame.
+    :param n_frames: Total number of frames to sample.
+    :return: A list of sampled frames.
+    """
+    n_uniform = int(n_frames * 0.3)
+    n_diff = int(n_frames * 0.3)
+    n_blur = (
+        n_frames - n_uniform - n_diff
+    )  # Ensures total is exactly n_frames even with rounding
+
+    # Uniform random sampling
+    uniform_indices = torch.randperm(len(video_frames))[:n_uniform]
+
+    # Sampling based on differences (maximized)
+    diff_indices = torch.argsort(torch.tensor(differences), descending=True)[:n_diff]
+
+    # Sampling based on minimal blur
+    blur_indices = torch.argsort(torch.tensor(blur_scores))[:n_blur]
+
+    # Combine and deduplicate indices
+    all_indices = torch.cat((uniform_indices, diff_indices, blur_indices))
+    unique_indices = torch.unique(all_indices)
+
+    # If deduplication leads to fewer frames, sample randomly to fill the gap
+    if len(unique_indices) < n_frames:
+        additional_indices = torch.randperm(len(video_frames))[
+            : n_frames - len(unique_indices)
+        ]
+        unique_indices = torch.unique(torch.cat((unique_indices, additional_indices)))
+
+    # Select frames based on indices
+    sampled_frames = [video_frames[i] for i in unique_indices]
+
+    return sampled_frames
+
+
 def train_video(
     video_path,
     epochs=5,
@@ -381,35 +424,27 @@ def train_video(
     camera_position.to(device)
 
     # Precompute depth for each image
-    depth_maps = []
-    for i in range(max_frames):
-        # compute with lib model
-        frame_image = video_frames[i].to(device)
-        frame_depth_estimate = image_depth(frame_image)
-        depth_maps.append(frame_depth_estimate)
+    depth_maps = [image_depth(video_frames[i].to(device)) for i in range(max_frames)]
 
     for epoch in range(epochs):
-        random_frame_indices = torch.randint(0, len(video_frames), (n_frames,))
+        sampled_frames = sample_with_scores(
+            video_frames, differences, blur_scores, n_frames
+        )
         batch_camera_poses = []
         batch_rays = []
         batch_t = []
         batch_output = []
         batch_depth = []
 
-        for i in range(n_frames):
+        for i, frame in enumerate(sampled_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=i)
-            frame_index = random_frame_indices[i]
-            random_frame = video_frames[frame_index].to(device)
-            frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
+            frame_depth_estimate = depth_maps[video_frames.index(frame)].to(
+                device
+            )  # 1xHxW
 
             sampled_colors, sampled_poses, sampled_rays, sampled_depths = (
                 sample_n_points_from_tensors(
-                    [
-                        random_frame,
-                        camera_poses,
-                        camera_rays,
-                        frame_depth_estimate,
-                    ],  # Add batch dimension to depth estimate
+                    [frame, camera_poses, camera_rays, frame_depth_estimate],
                     n_points,
                     size,
                     boost_edge=args.boost_edge,
@@ -421,7 +456,7 @@ def train_video(
             batch_output.append(sampled_colors)
             batch_depth.append(sampled_depths)
 
-            t = frame_index / max_frames
+            t = video_frames.index(frame) / max_frames
             t = torch.ones(n_points, 1) * t
             t = t.to(device)
             batch_t.append(t)
@@ -447,36 +482,21 @@ def train_video(
         total_loss = 0
 
         if args.scale_base_loss != 0:
-            if args.loss_type == "huber":
-                loss_fn = nn.HuberLoss()
-                base_loss = args.scale_base_loss * loss_fn(
-                    generated_colors, batch_output
-                )
-                log_data["huber_loss"] = base_loss.item()
-            elif args.loss_type == "mse":
-                loss_fn = nn.MSELoss()
-                base_loss = args.scale_base_loss * loss_fn(
-                    generated_colors, batch_output
-                )
-                log_data["mse_loss"] = base_loss.item()
+            loss_fn = nn.MSELoss() if args.loss_type == "mse" else nn.HuberLoss()
+            base_loss = args.scale_base_loss * loss_fn(generated_colors, batch_output)
+            log_data[f"{args.loss_type}_loss"] = base_loss.item()
             total_loss += base_loss
-        else:
-            base_loss = 0
 
         if args.scale_entropy_loss != 0:
             entropy_loss = args.scale_entropy_loss * entropy_regularization
             total_loss += entropy_loss
             log_data["entropy_loss"] = entropy_loss.item()
-        else:
-            entropy_loss = 0
 
         if args.scale_depth_loss != 0:
             depth_loss_fn = nn.MSELoss()  # Assuming depth loss is always MSE
             depth_loss = args.scale_depth_loss * depth_loss_fn(depth, batch_depth)
             total_loss += depth_loss
             log_data["depth_loss"] = depth_loss.item()
-        else:
-            depth_loss = 0
 
         optimizer.zero_grad()
         total_loss.backward()
