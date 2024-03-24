@@ -26,7 +26,7 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     Computes the blur score for a single frame using Kornia.
     """
     gray_frame_tensor = K.color.rgb_to_grayscale(frame)  # 1x1xHxW
-    edges = K.feature.sobel(gray_frame_tensor)  # 1x1xHxW
+    edges = K.filters.sobel(gray_frame_tensor)  # 1x1xHxW
     edge_magnitude = torch.sqrt(torch.sum(edges**2, dim=1, keepdim=True))  # 1x1xHxW
     max_val, min_val = torch.max(edge_magnitude), torch.min(edge_magnitude)
     normalized_edge_magnitude = (edge_magnitude - min_val) / (
@@ -36,7 +36,7 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     return blur_score.item()
 
 
-def blur_scores(video_path: str) -> torch.Tensor:
+def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     """
     Computes the blur score for each frame of a video using Kornia, saves the results as a SafeTensor based on the video file name,
     and attempts to load from cache if available. Returns a tensor of scores.
@@ -45,10 +45,6 @@ def blur_scores(video_path: str) -> torch.Tensor:
     if cache_path.exists():
         blur_scores_tensor = torch.load(cache_path)  # Load cached scores if available
     else:
-        video_frames, _, _ = torchvision.io.read_video(
-            video_path, pts_unit="sec"
-        )  # BxTxHxW
-        video_frames = video_frames.permute(0, 3, 1, 2).float() / 255.0  # BxTxCxHxW
         blur_scores_tensor = torch.tensor(
             [
                 compute_blur_score_single_frame(frame.unsqueeze(0))
@@ -57,6 +53,7 @@ def blur_scores(video_path: str) -> torch.Tensor:
             dtype=torch.float32,
         )
         torch.save(blur_scores_tensor, cache_path)
+
     return blur_scores_tensor
 
 
@@ -100,6 +97,9 @@ def deblur_video_vrt(
         ]
     )
 
+    # return new  filename
+    return output_folder / Path(video_path).name
+
 
 def image_difference_kornia(image_path1, image_path2):
     """
@@ -131,13 +131,14 @@ import torch
 import torchvision
 
 
-def load_video(video_path, max_frames=float("inf")):
-    video_frames, video_fps = torchvision.io.read_video(video_path)
+def load_video(video_path, max_frames=None):
+    video_frames, _, video_fps = torchvision.io.read_video(video_path, pts_unit="sec")
+    if max_frames is not None:
+        video_frames = video_frames[:max_frames]
     return video_frames, video_fps
 
 
-def video_difference_scores(video_path):
-    video_frames, _ = load_video(video_path, max_frames=float("inf"))
+def video_difference_scores(video_frames):
     differences = []
     for i in range(len(video_frames) - 1):
         differences.append(
@@ -152,9 +153,10 @@ def main():
     # Calculate differences between consecutive frames
     # download
     test_video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+    # download and cache skip ifexist
     video_path = "ElephantsDream.mp4"
-    print(f"Processing video: {video_path}")
     if not Path(video_path).exists():
+        print("downloading")
         download_start_time = time.time()
         response = requests.get(test_video_url)
         with open(video_path, "wb") as f:
@@ -163,8 +165,12 @@ def main():
         print(
             f"Download completed in {download_end_time - download_start_time:.2f} seconds."
         )
+
+    print(f"Processing video: {video_path}")
+
+    video_frames, video_fps = load_video(video_path, max_frames=args.max_frames)
     differences_start_time = time.time()
-    differences = video_difference_scores(video_path)
+    differences = video_difference_scores(video_frames)
     differences_end_time = time.time()
     print(
         f"Differences calculated in {differences_end_time - differences_start_time:.2f} seconds."
@@ -176,8 +182,10 @@ def main():
 
     deblur_start_time = time.time()
     # Deblur the video using VRT model
-    deblur_video_vrt(video_path, deblur_type="VRT")
-
+    deblurred_video_path = deblur_video_vrt(video_path, deblur_type="VRT")
+    deblurred_video_frames, _, _ = load_video(
+        deblurred_video_path, max_frames=args.max_frames
+    )
     deblur_end_time = time.time()
     print(f"Deblurring took {deblur_end_time - deblur_start_time:.2f} seconds.")
 

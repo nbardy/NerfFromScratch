@@ -1020,6 +1020,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
+    video_frames = load_video(video_path, max_frames=args.max_frames)
 
     # pretty print args with names
     print("Arguments")
@@ -1029,11 +1030,11 @@ if __name__ == "__main__":
     # preprocess
 
     if args.deblur_video:
-        deblurred_video = deblur_video_vrt(video_path)
+        deblurred_video = deblur_video_vrt(video_frames)
 
     if args.weight_blur_and_difference:
-        blur_scores = blur_scores(video_path)
-        differences = video_difference_scores(video_path)
+        blur_scores = blur_scores(video_frames)
+        differences = video_difference_scores(video_frames)
         # else none
     else:
         blur_scores = None
