@@ -29,9 +29,7 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     edges = K.filters.sobel(gray_frame_tensor)  # 1x1xHxW
     edge_magnitude = torch.sqrt(torch.sum(edges**2, dim=1, keepdim=True))  # 1x1xHxW
     max_val, min_val = torch.max(edge_magnitude), torch.min(edge_magnitude)
-    normalized_edge_magnitude = (edge_magnitude - min_val) / (
-        max_val - min_val
-    )  # 1x1xHxW
+    normalized_edge_magnitude = (edge_magnitude - min_val) / (max_val - min_val)  # 1x1xHxW
     blur_score = 1.0 - torch.mean(normalized_edge_magnitude)  # scalar
     return blur_score.item()
 
@@ -41,18 +39,23 @@ def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     Computes the blur score for each frame of a video using Kornia, saves the results as a SafeTensor based on the video file name,
     and attempts to load from cache if available. Returns a tensor of scores.
     """
-    cache_path = Path(f"{video_path}.blur_scores.pt")
+    # Step 1: Hash video frames for cache key
+    video_frames_hash = hash(tuple(video_frames))  # Hash of the frames for unique identification
+    cache_path = Path(f"cache/{video_frames_hash}_blur_scores.pt")  # Use hash in cache file name
+
+    # Step 2: Check if cache exists and load it
     if cache_path.exists():
         blur_scores_tensor = torch.load(cache_path)  # Load cached scores if available
     else:
-        blur_scores_tensor = torch.tensor(
-            [
-                compute_blur_score_single_frame(frame.unsqueeze(0))
-                for frame in video_frames
-            ],
-            dtype=torch.float32,
-        )
-        torch.save(blur_scores_tensor, cache_path)
+        # Step 3: Compute blur scores if cache does not exist
+        blur_scores_list = []
+        for frame in video_frames:
+            frame_blur_score = compute_blur_score_single_frame(frame.unsqueeze(0))  # Compute blur score for each frame
+            blur_scores_list.append(frame_blur_score)
+        blur_scores_tensor = torch.tensor(blur_scores_list, dtype=torch.float32)  # Convert list to tensor
+
+        # Step 4: Save computed blur scores to cache
+        torch.save(blur_scores_tensor, cache_path)  # Save scores to cache for future use
 
     return blur_scores_tensor
 
@@ -112,12 +115,8 @@ def image_difference_kornia(image_path1, image_path2):
             Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
-    image1, image2 = Image.open(image_path1).convert("RGB"), Image.open(
-        image_path2
-    ).convert("RGB")
-    image1, image2 = transforms(image1).unsqueeze(0), transforms(image2).unsqueeze(
-        0
-    )  # 1x3x224x224
+    image1, image2 = Image.open(image_path1).convert("RGB"), Image.open(image_path2).convert("RGB")
+    image1, image2 = transforms(image1).unsqueeze(0), transforms(image2).unsqueeze(0)  # 1x3x224x224
     model = resnet18(pretrained=True)
     model.eval()
     with torch.no_grad():
@@ -141,9 +140,7 @@ def load_video(video_path, max_frames=None):
 def video_difference_scores(video_frames):
     differences = []
     for i in range(len(video_frames) - 1):
-        differences.append(
-            image_difference_kornia(video_frames[i], video_frames[i + 1])
-        )
+        differences.append(image_difference_kornia(video_frames[i], video_frames[i + 1]))
     return differences
 
 
@@ -152,9 +149,15 @@ def main():
 
     # Calculate differences between consecutive frames
     # download
-    test_video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
-    # download and cache skip ifexist
-    video_path = "ElephantsDream.mp4"
+    def load_video_path():
+        """
+        Determines the video path and URL for downloading if necessary.
+        """
+        video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+        video_path = "ElephantsDream.mp4"
+        return video_url, video_path
+
+    test_video_url, video_path = load_video_path()
     if not Path(video_path).exists():
         print("downloading")
         download_start_time = time.time()
@@ -162,9 +165,7 @@ def main():
         with open(video_path, "wb") as f:
             f.write(response.content)
         download_end_time = time.time()
-        print(
-            f"Download completed in {download_end_time - download_start_time:.2f} seconds."
-        )
+        print(f"Download completed in {download_end_time - download_start_time:.2f} seconds.")
 
     print(f"Processing video: {video_path}")
 
@@ -172,9 +173,7 @@ def main():
     differences_start_time = time.time()
     differences = video_difference_scores(video_frames)
     differences_end_time = time.time()
-    print(
-        f"Differences calculated in {differences_end_time - differences_start_time:.2f} seconds."
-    )
+    print(f"Differences calculated in {differences_end_time - differences_start_time:.2f} seconds.")
     print(f"Differences shape: {len(differences)}")
     end_time = time.time()
 
@@ -183,9 +182,7 @@ def main():
     deblur_start_time = time.time()
     # Deblur the video using VRT model
     deblurred_video_path = deblur_video_vrt(video_path, deblur_type="VRT")
-    deblurred_video_frames, _, _ = load_video(
-        deblurred_video_path, max_frames=args.max_frames
-    )
+    deblurred_video_frames, _, _ = load_video(deblurred_video_path, max_frames=args.max_frames)
     deblur_end_time = time.time()
     print(f"Deblurring took {deblur_end_time - deblur_start_time:.2f} seconds.")
 
