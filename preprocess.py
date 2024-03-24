@@ -21,15 +21,12 @@ import kornia.contrib as KC
 model_cache = {}
 
 
-def blur_scores(image_path: str) -> float:
+def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     """
-    Approximates a wavelet-based motion blur score for an image using Kornia.
-    This function now accepts an image path instead of an Image object.
+    Computes the blur score for a single frame using Kornia.
     """
-    image = Image.open(image_path)  # Open image from path
-    img_tensor = ToTensor()(image).unsqueeze(0)  # 1xCxHxW
-    gray_img_tensor = K.color.rgb_to_grayscale(img_tensor)  # 1x1xHxW
-    edges = K.feature.sobel(gray_img_tensor)  # 1x1xHxW
+    gray_frame_tensor = K.color.rgb_to_grayscale(frame)  # 1x1xHxW
+    edges = K.feature.sobel(gray_frame_tensor)  # 1x1xHxW
     edge_magnitude = torch.sqrt(torch.sum(edges**2, dim=1, keepdim=True))  # 1x1xHxW
     max_val, min_val = torch.max(edge_magnitude), torch.min(edge_magnitude)
     normalized_edge_magnitude = (edge_magnitude - min_val) / (
@@ -37,6 +34,23 @@ def blur_scores(image_path: str) -> float:
     )  # 1x1xHxW
     blur_score = 1.0 - torch.mean(normalized_edge_magnitude)  # scalar
     return blur_score.item()
+
+
+def blur_scores(video_path: str) -> float:
+    """
+    Approximates a wavelet-based motion blur score for a video by averaging the scores of its frames using Kornia.
+    This function now accepts a video path instead of an Image object and uses torch for video loading.
+    """
+    video = torchvision.io.read_video(video_path, pts_unit="sec")[
+        0
+    ]  # Load video, returns (video_frames, audio, info)
+    video_frames = (
+        video.permute(0, 3, 1, 2).float() / 255.0
+    )  # BxTxHxW to BxCxHxW and normalize
+    blur_scores = [
+        compute_blur_score_single_frame(frame.unsqueeze(0)) for frame in video_frames
+    ]
+    return np.mean(blur_scores) if blur_scores else 0.0
 
 
 def deblur_video_vrt(
