@@ -520,7 +520,7 @@ def sample_with_scores_and_runs(
     return sampled_frames, unique_indices
 
 
-def sample_by_args(
+def sample_video_frames_by_args(
     video_frames, n_frames=None, blur_scores=None, differences=None, args=None
 ):
     """
@@ -611,7 +611,7 @@ def train_video(
     depth_maps = [image_depth(video_frames[i].to(device)) for i in range(max_frames)]
 
     for epoch in range(epochs):
-        sampled_frames, sampled_indices = sample_by_args(
+        sampled_frames, sampled_indices = sample_video_frames_by_args(
             video_frames,
             n_frames=n_frames,
             differences=differences,
