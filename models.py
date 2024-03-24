@@ -401,7 +401,8 @@ class SpaceTimeLookTable(nn.Module):
             + 8 * (11 * 8)
         )
 
-        self.model_sequence = nn.Sequential(
+        # Do one layer of linear+non-linear on features
+        self.value_mlp = nn.Sequential(
             RMSNorm(total_feature_size),
             nn.Linear(total_feature_size, inner_dim, bias=False),
             nn.ReLU(),
@@ -418,12 +419,14 @@ class SpaceTimeLookTable(nn.Module):
         idx1 = self.table1.scale_indices(pos)
         idx2 = self.table2.scale_indices(pos)
         idx3 = self.table3.scale_indices(pos)
-        t_idx = self.space_time_table_1.scale_indices(
-            t.unsqueeze(-1)
-        )  # Assuming t is scaled similarly
 
         # Combine pos and t for 4D indexing in space_time_table_1
-        idx4 = torch.cat([idx3, t_idx], dim=-1)
+        # Concatenate position and time for 4D tensor Bx4
+        pos_t = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
+        # Scale indices for space-time tables
+        idx_space_time_table_1 = self.space_time_table_1.scale_indices(pos_t)
+        idx_space_time_table_2 = self.space_time_table_2.scale_indices(pos_t)
+        idx_time_focus = self.time_focus_spacetime_table3.scale_indices(pos_t)
 
         # Get base features from spatial tables
         base_features0 = self.table0(idx0)  # BxCxHxW
@@ -432,32 +435,16 @@ class SpaceTimeLookTable(nn.Module):
         base_features3 = self.table3(idx3)  # BxCxHxW
 
         # Get neighbor features from spatial tables
-        neighbor_features0 = lookup_neighbors(
-            idx0, self.face_directions, self.table0
-        )  # Bx(N*C)xHxW
-        neighbor_features1 = lookup_neighbors(
-            idx1, self.face_directions, self.table1
-        )  # Bx(N*C)xHxW
-        neighbor_features2 = lookup_neighbors(
-            idx2, self.face_directions, self.table2
-        )  # Bx(N*C)xHxW
-        neighbor_features3 = lookup_neighbors(
-            idx3, self.face_directions, self.table3
-        )  # Bx(N*C)xHxW
-
-        # Combine base and neighbor features
-        features0 = torch.cat(
-            [base_features0, neighbor_features0], dim=1
-        )  # Bx((1+N)*C)xHxW
-        features1 = torch.cat(
-            [base_features1, neighbor_features1], dim=1
-        )  # Bx((1+N)*C)xHxW
-        features2 = torch.cat(
-            [base_features2, neighbor_features2], dim=1
-        )  # Bx((1+N)*C)xHxW
-        features3 = torch.cat(
-            [base_features3, neighbor_features3], dim=1
-        )  # Bx((1+N)*C)xHxW
+        neighbor_features0 = lookup_neighbors(idx0, self.face_directions, self.table0)
+        neighbor_features1 = lookup_neighbors(idx1, self.face_directions, self.table1)
+        neighbor_features2 = lookup_neighbors(idx2, self.face_directions, self.table2)
+        neighbor_features3 = lookup_neighbors(idx3, self.face_directions, self.table3)
+        # Combine base and neighbor features for all tables
+        features0 = torch.cat([base_features0, neighbor_features0], dim=1)
+        features1 = torch.cat([base_features1, neighbor_features1], dim=1)
+        features2 = torch.cat([base_features2, neighbor_features2], dim=1)
+        features3 = torch.cat([base_features3, neighbor_features3], dim=1)
+        # All features tensors are of shape Bx((1+N)*C)xHxW
         # Lookup temporal features using the new utility function
         spacetime_features_1 = lookup_neighbors(
             t_idx, self.basic_space_time_offsets, self.space_time_table_1
@@ -488,7 +475,7 @@ class SpaceTimeLookTable(nn.Module):
         all_features = F.relu(all_features)
 
         # Downsize feature dimension and append viewing direction and timestep
-        downsized_features = self.model_sequence(all_features)
+        downsized_features = self.value_mlp(all_features)
         final_features = torch.cat([downsized_features, dir, t.unsqueeze(-1)], dim=-1)
 
         # Apply a biasless linear hidden layer
