@@ -382,28 +382,46 @@ def train_video(
     scene_function.to(device)
     camera_position.to(device)
 
+    # Precompute depth for each image
+    depth_maps = []
+    for i in range(max_frames):
+        # compute with lib model
+        frame_image = video_frames[i].to(device)
+        frame_depth_estimate = image_depth(frame_image)
+        depth_maps.append(frame_depth_estimate)
+
     for epoch in range(epochs):
         random_frame_indices = torch.randint(0, len(video_frames), (n_frames,))
         batch_camera_poses = []
         batch_rays = []
         batch_t = []
         batch_output = []
+        batch_depth = []
 
         for i in range(n_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=i)
             frame_index = random_frame_indices[i]
             random_frame = video_frames[frame_index].to(device)
+            frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            sampled_colors, sampled_poses, sampled_rays = sample_n_points_from_tensors(
-                [random_frame, camera_poses, camera_rays],
-                n_points,
-                size,
-                boost_edge=args.boost_edge,
+            sampled_colors, sampled_poses, sampled_rays, sampled_depths = (
+                sample_n_points_from_tensors(
+                    [
+                        random_frame,
+                        camera_poses,
+                        camera_rays,
+                        frame_depth_estimate,
+                    ],  # Add batch dimension to depth estimate
+                    n_points,
+                    size,
+                    boost_edge=args.boost_edge,
+                )
             )
 
             batch_camera_poses.append(sampled_poses)
             batch_rays.append(sampled_rays)
             batch_output.append(sampled_colors)
+            batch_depth.append(sampled_depths)
 
             t = frame_index / max_frames
             t = torch.ones(n_points, 1) * t
@@ -414,6 +432,7 @@ def train_video(
         batch_rays = torch.cat(batch_rays, dim=0)
         batch_output = torch.cat(batch_output, dim=0)
         batch_t = torch.cat(batch_t, dim=0)
+        batch_depth = torch.cat(batch_depth, dim=0)
 
         generated_colors, entropy_regularization, depth = render_rays(
             scene_function,
@@ -426,15 +445,46 @@ def train_video(
             args=args,
         )
 
-        loss = nn.HuberLoss()
-        base_loss = loss(generated_colors, batch_output) + entropy_regularization
+        log_data = {}
+        total_loss = 0
+
+        if args.scale_base_loss != 0:
+            if args.loss_type == "huber":
+                loss_fn = nn.HuberLoss()
+                base_loss = args.scale_base_loss * loss_fn(
+                    generated_colors, batch_output
+                )
+                log_data["huber_loss"] = base_loss.item()
+            elif args.loss_type == "mse":
+                loss_fn = nn.MSELoss()
+                base_loss = args.scale_base_loss * loss_fn(
+                    generated_colors, batch_output
+                )
+                log_data["mse_loss"] = base_loss.item()
+            total_loss += base_loss
+        else:
+            base_loss = 0
+
+        if args.scale_entropy_loss != 0:
+            entropy_loss = args.scale_entropy_loss * entropy_regularization
+            total_loss += entropy_loss
+            log_data["entropy_loss"] = entropy_loss.item()
+        else:
+            entropy_loss = 0
+
+        if args.scale_depth_loss != 0:
+            depth_loss_fn = nn.MSELoss()  # Assuming depth loss is always MSE
+            depth_loss = args.scale_depth_loss * depth_loss_fn(depth, batch_depth)
+            total_loss += depth_loss
+            log_data["depth_loss"] = depth_loss.item()
+        else:
+            depth_loss = 0
 
         optimizer.zero_grad()
-        base_loss.backward()
+        total_loss.backward()
         optimizer.step()
         scheduler.step()
 
-        log_data = {}
         if epoch % args.validation_steps == 0:
             log_data.update(
                 log_image(
@@ -447,8 +497,8 @@ def train_video(
                 )
             )
 
-        log_data["total loss"] = base_loss.item()
-        log_data["learning rate"] = scheduler.get_last_lr()[0]
+        log_data["total_loss"] = total_loss.item()
+        log_data["learning_rate"] = scheduler.get_last_lr()[0]
         wandb.log(log_data)
 
 
@@ -620,7 +670,6 @@ def inference_nerf(
     return image
 
 
-# on main let's run the training loop
 if __name__ == "__main__":
     import argparse
 
@@ -636,18 +685,17 @@ if __name__ == "__main__":
         default=30,
         help="Number of points to sample for training",
     )
-    # n_frames
     parser.add_argument(
         "--n_frames",
         type=int,
         default=10,
         help="Number of frames to sample from the video",
     )
-    # validation sample rate
     parser.add_argument("--validation_steps", type=int, default=40)
     parser.add_argument("--video_validation_steps", type=int, default=50)
-    # Model = mlp, mlp-gauss
-    parser.add_argument("--model", type=str, default="mlp", help="Model to use")
+    parser.add_argument(
+        "--model", type=str, default="spacetime-lookup", help="Model to use"
+    )
     parser.add_argument(
         "--max_frames",
         type=int,
@@ -666,47 +714,67 @@ if __name__ == "__main__":
         default=False,
         help="Enable weighted frame sampling based on blur and difference.",
     )
-    # boost edge
     parser.add_argument(
         "--boost_edge",
         action="store_true",
         default=True,
         help="Enable edge boosting.",
     )
-    # Add entropy loss flag
     parser.add_argument(
         "--enable_entropy_loss",
         action="store_true",
-        default=False,
+        default=True,
         help="Enable entropy loss regularization.",
     )
-    # geo style text
     parser.add_argument(
         "--geo_style_text",
-        action="store_true",
-        default=False,
-        help="Enable geo style text.",
+        type=str,
+        default=None,
+        help="Text prompt for geo style.",
     )
-    # geo style image
     parser.add_argument(
         "--geo_style_image",
-        action="store_true",
-        default=False,
-        help="Enable geo style image.",
+        type=str,
+        default=None,
+        help="Path to an image file for geo style.",
     )
-    # clip style text
     parser.add_argument(
         "--clip_style_text",
-        action="store_true",
-        default=False,
-        help="Enable clip style text.",
+        type=str,
+        default=None,
+        help="Text prompt for clip style.",
     )
-    # clip style image
     parser.add_argument(
         "--clip_style_image",
-        action="store_true",
-        default=False,
-        help="Enable clip style image.",
+        type=str,
+        default=None,
+        help="Path to an image file for clip style.",
+    )
+    # Add arguments for loss scaling
+    parser.add_argument(
+        "--scale_base_loss",
+        type=float,
+        default=1.0,
+        help="Scaling factor for base loss.",
+    )
+    parser.add_argument(
+        "--scale_entropy_loss",
+        type=float,
+        default=1.0,
+        help="Scaling factor for entropy loss.",
+    )
+    parser.add_argument(
+        "--scale_depth_loss",
+        type=float,
+        default=1.0,
+        help="Scaling factor for depth loss.",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "huber"],
+        help="Type of loss function to use for base loss.",
     )
 
     args = parser.parse_args()
@@ -733,13 +801,25 @@ if __name__ == "__main__":
     # Launch training with deblurred video if enabled, otherwise use original video path
     video_to_train = deblurred_video if args.deblur_video else video_path
 
-    train_video(
-        video_to_train,
-        epochs=args.epochs,
-        n_points=args.n_points,
-        n_frames=args.n_frames,
-        max_frames=args.max_frames,
-        blur_scores=blur_scores,
-        differences=differences,
-        args=args,  # Pass args to access enable_entropy_loss flag
-    )
+    if args.geo_style_image or args.clip_style_image:
+        train_style_video(
+            video_to_train,
+            epochs=args.epochs,
+            n_points=args.n_points,
+            n_frames=args.n_frames,
+            max_frames=args.max_frames,
+            blur_scores=blur_scores,
+            differences=differences,
+            args=args,  # Pass args to access style-related flags
+        )
+    else:
+        train_video(
+            video_to_train,
+            epochs=args.epochs,
+            n_points=args.n_points,
+            n_frames=args.n_frames,
+            max_frames=args.max_frames,
+            blur_scores=blur_scores,
+            differences=differences,
+            args=args,  # Pass args to access enable_entropy_loss flag
+        )
