@@ -18,7 +18,7 @@ from PIL import Image
 
 from models import get_model
 from utils import get_default_device
-from preprocess import blur_scores, video_difference_scores, deblur_video_vrt
+from preprocess import blur_scores, video_difference_scores, deblur_video_vrt, load_video
 from peft import inject_adapter_in_model, LoraConfig
 
 from depth import image_depth
@@ -74,9 +74,7 @@ def make_camera_rays(
     viewport_positions = total_shift + viewport_center.unsqueeze(1).unsqueeze(2)
 
     # Get viewport ray directions.
-    viewport_ray_directions = viewport_positions - camera_location.unsqueeze(
-        1
-    ).unsqueeze(2)
+    viewport_ray_directions = viewport_positions - camera_location.unsqueeze(1).unsqueeze(2)
 
     return viewport_positions, viewport_ray_directions
 
@@ -106,31 +104,6 @@ class LearnableCameraPosition(nn.Module):
         return make_camera_rays(position, direction, up_vector, viewport_size=size)
 
 
-def load_video(filename, max_frames=100):
-    cap = cv2.VideoCapture(filename)
-    video_frames = []
-    frame_count = 0
-    while frame_count < max_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-        pil_frame = Image.fromarray(frame)
-
-        # Custom image transform without standard normalization
-        image_transform = transforms.Compose(
-            [
-                transforms.ToTensor(),  # Scales to [0, 1]
-                # Optionally resize or apply other transformations here
-            ]
-        )
-
-        video_frames.append(image_transform(pil_frame))
-        frame_count += 1
-    cap.release()
-    return video_frames, len(video_frames)
-
-
 ## Samples a subset of the points from a set of tensors
 # We use this to train
 
@@ -141,9 +114,7 @@ def normalize_edge_detection(tensor):
     """
     print(f"Input tensor size: {tensor.size()}")  # Print input tensor size
     # Compute the mean across the batch dimension and apply Sobel filter with normalization
-    edge_mask = kornia.filters.sobel(
-        tensor.mean(dim=0, keepdim=True), normalized=True, eps=1e-6
-    )  # 1xCxHxW
+    edge_mask = kornia.filters.sobel(tensor.mean(dim=0, keepdim=True), normalized=True, eps=1e-6)  # 1xCxHxW
     # Normalize the edge mask to have values between 0 and 1
     min_val, max_val = edge_mask.min(), edge_mask.max()
     edge_mask_normalized = (edge_mask - min_val) / (max_val - min_val)  # 1xCxHxW
@@ -172,11 +143,7 @@ def sample_n_points_from_tensors(
         # use first image tensor RGB as the base for edge detection
         stacked_tensors = torch.stack(image_tensors[0])  # BxCxHxW
         edge_masks = normalize_edge_detection(stacked_tensors)  # BxHxW
-        blurred_edge_masks = kornia.filters.box_blur(
-            edge_masks.unsqueeze(1), kernel_size=(5, 5)
-        ).squeeze(
-            1
-        )  # BxHxW
+        blurred_edge_masks = kornia.filters.box_blur(edge_masks.unsqueeze(1), kernel_size=(5, 5)).squeeze(1)  # BxHxW
         # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
         n_uniform = int(n_points * 0.05)
         n_edge = int(n_points * 0.9)
@@ -188,20 +155,12 @@ def sample_n_points_from_tensors(
 
         # Weighted sampling for edge and blurred edge based on edge detection per frame
         edge_weights = edge_masks.view(edge_masks.size(0), -1).mean(dim=1)  # B
-        blurred_edge_weights = blurred_edge_masks.view(
-            blurred_edge_masks.size(0), -1
-        ).mean(
-            dim=1
-        )  # B
+        blurred_edge_weights = blurred_edge_masks.view(blurred_edge_masks.size(0), -1).mean(dim=1)  # B
         edge_indices = sample_indices(edge_weights, n_edge, total_pixels)
-        blurred_edge_indices = sample_indices(
-            blurred_edge_weights, n_blurred_edge, total_pixels
-        )
+        blurred_edge_indices = sample_indices(blurred_edge_weights, n_blurred_edge, total_pixels)
 
         # Combine and shuffle indices
-        combined_indices = torch.cat(
-            (uniform_indices, edge_indices, blurred_edge_indices)
-        )
+        combined_indices = torch.cat((uniform_indices, edge_indices, blurred_edge_indices))
     else:
         # Uniform sampling
         uniform_prob_dist = torch.ones(total_pixels) / total_pixels
@@ -234,14 +193,10 @@ def compute_accumulated_transmittance(alphas):
     )
 
 
-def render_rays(
-    nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192, T=0.1, args=None
-):
+def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192, T=0.1, args=None):
     device = ray_origins.device
     # Sample points along each ray
-    t = torch.linspace(hn, hf, nb_bins, device=device).expand(
-        ray_origins.shape[0], nb_bins
-    )
+    t = torch.linspace(hn, hf, nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)
     # Perturb sampling along each ray for stochastic sampling
     mid = (t[:, :-1] + t[:, 1:]) / 2.0
     lower = torch.cat((t[:, :1], mid), -1)
@@ -258,13 +213,9 @@ def render_rays(
     )
 
     # Compute 3D points along each ray
-    x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(
-        1
-    )  # [batch_size, nb_bins, 3]
+    x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
-    ray_directions = ray_directions.expand(
-        nb_bins, ray_directions.shape[0], 3
-    ).transpose(0, 1)
+    ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
 
     # Query NeRF model for colors and densities
     colors, sigma = nerf_model(x.reshape(-1, 3), ray_directions.reshape(-1, 3))
@@ -273,9 +224,7 @@ def render_rays(
 
     # Compute alpha values and weights for color accumulation
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
-    weights = compute_accumulated_transmittance(1 - alpha).unsqueeze(
-        2
-    ) * alpha.unsqueeze(2)
+    weights = compute_accumulated_transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
 
     # Compute probability distribution for entropy regularization
     if args.enable_entropy_loss:
@@ -318,18 +267,14 @@ def compute_style_loss(batch_output, depth, args):
 
     # Process geometry style text prompts
     if args.geo_style_text:
-        geo_text_embeds = embed_text(
-            f"A depth map, {args.style_prompt}", device=device
-        )  # [Batch, Seq_len, Emb_dim]
+        geo_text_embeds = embed_text(f"A depth map, {args.style_prompt}", device=device)  # [Batch, Seq_len, Emb_dim]
         geo_loss = F.cross_entropy(geo_text_embeds, depth_map_clip_embed)
         total_loss += args.scale_geo * geo_loss
         loss_dict["geo_style_loss"] = geo_loss.item()
 
     # Process clip style text prompts
     if args.clip_style_text:
-        style_text_embeds = embed_text(
-            [args.clip_style_text], device=device
-        )  # [Batch, Seq_len, Emb_dim]
+        style_text_embeds = embed_text([args.clip_style_text], device=device)  # [Batch, Seq_len, Emb_dim]
         style_loss = F.cross_entropy(style_text_embeds, image_embeds)
         total_loss += args.scale_style * style_loss
         loss_dict["style_loss"] = style_loss.item()
@@ -356,9 +301,7 @@ def exponential_cluster_indices_torch(exponential, offset_count, cluster_scale=1
     return torch.tensor(indices, dtype=torch.int)
 
 
-def sample_exponential_clusters(
-    video_length, n_frames, exponential, offset_count, cluster_scale=1
-):
+def sample_exponential_clusters(video_length, n_frames, exponential, offset_count, cluster_scale=1):
     """
     Wrapper function to generate n_frames of indices with exponential spacing, clamped to video length.
 
@@ -374,9 +317,7 @@ def sample_exponential_clusters(
         # Randomly select a center for the cluster within the video length
         center = torch.randint(0, video_length, (1,))
         # Generate indices for this cluster
-        indices = center + exponential_cluster_indices_torch(
-            exponential, offset_count, cluster_scale
-        )
+        indices = center + exponential_cluster_indices_torch(exponential, offset_count, cluster_scale)
         # Clamp indices to valid range and remove duplicates
         indices = torch.clamp(indices, 0, video_length - 1)
         all_indices = torch.cat((all_indices, indices))
@@ -390,9 +331,7 @@ def sample_exponential_clusters(
     return all_indices
 
 
-def sample_uniform_with_runs(
-    video_frames, n_frames, cluster_run_count=1, cluster_exponential=2, cluster_scale=1
-):
+def sample_uniform_with_runs(video_frames, n_frames, cluster_run_count=1, cluster_exponential=2, cluster_scale=1):
     """
     Uniformly samples frames from the video, with optional clustered sampling that includes scaling of cluster spacing.
 
@@ -406,15 +345,9 @@ def sample_uniform_with_runs(
     assert isinstance(video_frames, list) and all(
         isinstance(frame, torch.Tensor) for frame in video_frames
     ), "video_frames must be a list of 3D tensors [C, H, W]"
-    assert (
-        isinstance(n_frames, int) and n_frames > 0
-    ), "n_frames must be a positive integer"
-    assert (
-        isinstance(cluster_run_count, int) and cluster_run_count > 0
-    ), "cluster_run_count must be a positive integer"
-    assert isinstance(cluster_exponential, int) or isinstance(
-        cluster_exponential, float
-    ), "cluster_exponential must be a number"
+    assert isinstance(n_frames, int) and n_frames > 0, "n_frames must be a positive integer"
+    assert isinstance(cluster_run_count, int) and cluster_run_count > 0, "cluster_run_count must be a positive integer"
+    assert isinstance(cluster_exponential, int) or isinstance(cluster_exponential, float), "cluster_exponential must be a number"
     assert isinstance(cluster_scale, int), "cluster_scale must be an integer"
 
     video_length = len(video_frames)
@@ -483,9 +416,7 @@ def sample_with_scores_and_runs(
     # Clustered sampling with exponential offset pattern
     cluster_indices = torch.empty(0, dtype=torch.int)
     video_length = len(video_frames)
-    frames_per_run = max(
-        1, n_cluster // cluster_run_count
-    )  # Ensure at least 1 frame per run
+    frames_per_run = max(1, n_cluster // cluster_run_count)  # Ensure at least 1 frame per run
     for _ in range(cluster_run_count):
         indices = sample_exponential_clusters(
             video_length,
@@ -501,21 +432,15 @@ def sample_with_scores_and_runs(
             break
     # Ensure the number of cluster frames is exactly n_cluster by randomly selecting if over
     if cluster_indices.size(0) > n_cluster:
-        cluster_indices = cluster_indices[
-            torch.randperm(cluster_indices.size(0))[:n_cluster]
-        ]
+        cluster_indices = cluster_indices[torch.randperm(cluster_indices.size(0))[:n_cluster]]
 
     # Combine and deduplicate indices
-    all_indices = torch.cat(
-        (uniform_indices, diff_indices, blur_indices, cluster_indices)
-    )
+    all_indices = torch.cat((uniform_indices, diff_indices, blur_indices, cluster_indices))
     unique_indices = torch.unique(all_indices)
 
     # If deduplication leads to fewer frames, sample randomly to fill the gap
     if len(unique_indices) < n_frames:
-        additional_indices = torch.randperm(len(video_frames))[
-            : n_frames - len(unique_indices)
-        ]
+        additional_indices = torch.randperm(len(video_frames))[: n_frames - len(unique_indices)]
         unique_indices = torch.unique(torch.cat((unique_indices, additional_indices)))
 
     # Select frames based on indices
@@ -524,9 +449,7 @@ def sample_with_scores_and_runs(
     return sampled_frames, unique_indices
 
 
-def sample_video_frames_by_args(
-    video_frames, n_frames=None, blur_scores=None, differences=None, args=None
-):
+def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, differences=None, args=None):
     """
     Function to select the appropriate sampling method based on provided arguments.
     Supports a couple different weighting strategies for choosing frame
@@ -549,12 +472,8 @@ def sample_video_frames_by_args(
         )
         indices += sampled_indices
     else:
-        assert (
-            blur_scores is not None
-        ), "Blur scores are required for weighted sampling."
-        assert (
-            differences is not None
-        ), "Differences are required for weighted sampling."
+        assert blur_scores is not None, "Blur scores are required for weighted sampling."
+        assert differences is not None, "Differences are required for weighted sampling."
 
         sampled_frames, sampled_indices = sample_with_scores_and_runs(
             video_frames,
@@ -566,9 +485,7 @@ def sample_video_frames_by_args(
         indices += sampled_indices
 
     if args.sample_long_temporal:
-        long_temporal_indices = sample_exponential_clusters(
-            len(video_frames), 11, 8, 5, 10
-        )
+        long_temporal_indices = sample_exponential_clusters(len(video_frames), 11, 8, 5, 10)
         long_temporal_frames = [video_frames[i] for i in long_temporal_indices.tolist()]
         sampled_frames += long_temporal_frames
         indices += long_temporal_indices
@@ -606,7 +523,8 @@ def train_video(
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     device = get_default_device()
-    video_frames, max_frames = load_video(video_path, max_frames=max_frames)
+    video_frames, video_fps = load_video(video_path, max_frames=max_frames)
+
     size = video_frames[0].shape
     size = [size[1], size[2]]
 
@@ -631,18 +549,14 @@ def train_video(
         batch_depth = []
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
-            camera_poses, camera_rays = camera_position.get_rays(
-                size=size, frame_idx=frame_index
-            )
+            camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = (
-                sample_n_points_from_tensors(
-                    [frame, camera_poses, camera_rays, frame_depth_estimate],
-                    n_points,
-                    size,
-                    boost_edge=args.boost_edge,
-                )
+            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
+                [frame, camera_poses, camera_rays, frame_depth_estimate],
+                n_points,
+                size,
+                boost_edge=args.boost_edge,
             )
 
             batch_camera_poses.append(sampled_poses)
@@ -722,18 +636,11 @@ def train_style_video(
     differences=None,
     args=None,
 ):
-    assert (
-        args.clip_style_image
-        or args.clip_style_text
-        or args.geo_style_image
-        or args.geo_style_text
-    ), "Style training requires CLIP style image or text."
+    assert args.clip_style_image or args.clip_style_text or args.geo_style_image or args.geo_style_text, "Style training requires CLIP style image or text."
 
     wandb.init(project="3D_nerf")
 
-    camera_position = LearnableCameraPosition(
-        n_frames=1
-    )  # Single frame for style training
+    camera_position = LearnableCameraPosition(n_frames=1)  # Single frame for style training
     scene_function = get_model(args.model)
 
     # Configure LoRA
@@ -747,9 +654,7 @@ def train_style_video(
     scene_function_with_lora = inject_adapter_in_model(lora_config, scene_function)
 
     # Filter parameters to only include those from LoRA layers for optimization
-    lora_params = [
-        p for n, p in scene_function_with_lora.named_parameters() if "lora" in n
-    ]
+    lora_params = [p for n, p in scene_function_with_lora.named_parameters() if "lora" in n]
 
     optimizer = torch.optim.Adam(
         lora_params,
@@ -759,9 +664,7 @@ def train_style_video(
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     device = get_default_device()
-    video_frames, _ = load_video(
-        video_path, max_frames=1
-    )  # Only load a single frame for style training
+    video_frames, _ = load_video(video_path, max_frames=1)  # Only load a single frame for style training
     size = [384, 384]  # Fixed resolution for CLIP model
 
     scene_function_with_lora.to(device)
@@ -770,13 +673,9 @@ def train_style_video(
     for epoch in range(epochs):
         frame_index = 0  # Always use the first frame for style training
         frame = video_frames[frame_index].to(device)
-        frame = torch.nn.functional.interpolate(
-            frame.unsqueeze(0), size=size, mode="bilinear", align_corners=False
-        ).squeeze(0)
+        frame = torch.nn.functional.interpolate(frame.unsqueeze(0), size=size, mode="bilinear", align_corners=False).squeeze(0)
 
-        camera_poses, camera_rays = camera_position.get_rays(
-            size=size, frame_idx=frame_index
-        )
+        camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
         generated_colors, _, depth = render_rays(
             scene_function_with_lora,
             camera_poses,
@@ -830,9 +729,7 @@ def log_video(scene_function, video_frames, camera_position, size, max_frames, d
         t = torch.ones(size[0] * size[1], 1) * t
         t = t.to(device)
 
-        camera_poses, camera_rays = camera_position.get_rays(
-            size=size, frame_idx=int(0.5 * len(video_frames)) + i
-        )
+        camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=int(0.5 * len(video_frames)) + i)
         image = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)
         frames.append(np.array(image))
 
@@ -855,17 +752,13 @@ def inference_nerf(
     # Flatten camera positions and rays for model input using einops rearrange
     camera_positions_flat = rearrange(camera_positions, "c w h -> (w h) c")  # [W*H, 3]
     camera_rays_flat = rearrange(camera_rays, "c w h -> (w h) c")  # [W*H, 3]
-    model_input = torch.cat(
-        [camera_positions_flat, camera_rays_flat, t], dim=1
-    )  # [(W*H), 6]
+    model_input = torch.cat([camera_positions_flat, camera_rays_flat, t], dim=1)  # [(W*H), 6]
 
     # Initialize tensor to store generated colors
     generated_colors = torch.empty((model_input.shape[0], 3), device=model_input.device)
 
     # Process in batches to avoid memory overflow
-    num_batches = (
-        model_input.shape[0] + max_inference_batch_size - 1
-    ) // max_inference_batch_size
+    num_batches = (model_input.shape[0] + max_inference_batch_size - 1) // max_inference_batch_size
 
     for i in range(num_batches):
         start_idx = i * max_inference_batch_size
@@ -877,9 +770,7 @@ def inference_nerf(
     # Scale colors back to [0, 255] and reshape to image dimensions
     scaled_colors = ((generated_colors + 1) * 0.5) * 255  # [(W*H), 3]
     scaled_colors = scaled_colors.clamp(0, 255).byte()
-    scaled_colors = rearrange(
-        scaled_colors, "(w h) c -> h w c", w=image_size[0], h=image_size[1]
-    )  # [H, W, 3]
+    scaled_colors = rearrange(scaled_colors, "(w h) c -> h w c", w=image_size[0], h=image_size[1])  # [H, W, 3]
 
     # Convert to PIL Image for visualization
     image_data = scaled_colors.cpu().numpy()
@@ -890,12 +781,8 @@ def inference_nerf(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Train a NeRF model on a single image."
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=100, help="Number of epochs to train."
-    )
+    parser = argparse.ArgumentParser(description="Train a NeRF model on a single image.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train.")
     parser.add_argument(
         "--n_points",
         type=int,
@@ -910,9 +797,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--validation_steps", type=int, default=40)
     parser.add_argument("--video_validation_steps", type=int, default=50)
-    parser.add_argument(
-        "--model", type=str, default="spacetime-lookup", help="Model to use"
-    )
+    parser.add_argument("--model", type=str, default="spacetime-lookup", help="Model to use")
     parser.add_argument(
         "--max_frames",
         type=int,
