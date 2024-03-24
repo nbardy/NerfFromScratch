@@ -634,9 +634,7 @@ def train_video(
 
         for i, frame in enumerate(sampled_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=i)
-            frame_depth_estimate = depth_maps[video_frames.index(frame)].to(
-                device
-            )  # 1xHxW
+            frame_depth_estimate = depth_maps[frame].to(device)  # 1xHxW
 
             sampled_colors, sampled_poses, sampled_rays, sampled_depths = (
                 sample_n_points_from_tensors(
