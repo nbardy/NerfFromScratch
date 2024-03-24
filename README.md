@@ -49,3 +49,13 @@ Allow training of a video NERF in 50-60 seconds that allows high quality video s
 - [x] Regularize loss over empty space from InfoNERF(ignore KL loss from infoNERF)
 - [x] Use fast lookup tables inspired by nvidia Instant NGP
 - [] (TODO): Use actual CUDA kernels from instant-NGP(Although these won't be spacetime compatible)(The torch tables may be fast enough)
+
+### Logs
+
+Logs are currently going to weights and biases logs here:
+
+NOTE: Theses are small test runs to validate the code is working. Have not scaled this up to longer videos yet.
+
+https://wandb.ai/nbardy-facet/3D_nerf
+
+![alt text](image.png)
