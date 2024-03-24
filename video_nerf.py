@@ -354,6 +354,8 @@ def train_video(
     n_frames=10,
     max_frames=None,
     args=None,
+    blur_scores=None,
+    differences=None,
 ):
     assert max_frames is not None
     assert args is not None
@@ -501,6 +503,8 @@ def train_video(
 def train_style_video(
     video_path,
     epochs=5,
+    blur_scores=None,
+    differences=None,
     args=None,
 ):
     assert (
