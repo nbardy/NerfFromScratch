@@ -45,18 +45,11 @@ def image_depth(image_tensor, cache_dir="cache"):
     if not isinstance(image_tensor, torch.Tensor):
         raise TypeError("Input must be a torch.Tensor")
 
-    # Debugging: Print min and max of the incoming tensor
-    print("[debug] Depth tensor")
-    print(
-        f"Incoming tensor min: {image_tensor.min().item()}, max: {image_tensor.max().item()}"
-    )
-
     # Normalize the tensor to the range [0, 1] if it's not already
     if image_tensor.min() < 0 or image_tensor.max() > 1:
         image_tensor = (image_tensor - image_tensor.min()) / (
             image_tensor.max() - image_tensor.min()
         )
-        print("Tensor normalized to [0, 1] range.")
 
     device = image_tensor.device  # Use the device of the input image tensor
 

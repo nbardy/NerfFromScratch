@@ -169,13 +169,17 @@ def sample_n_points_from_tensors(
 
     if boost_edge:
         # Edge detection and normalization for all tensors in the batch
-        stacked_tensors = torch.stack(image_tensors)  # BxCxHxW
+        # use first image tensor RGB as the base for edge detection
+        stacked_tensors = torch.stack(image_tensors[0])  # BxCxHxW
         edge_masks = normalize_edge_detection(stacked_tensors)  # BxHxW
-        blurred_edge_masks = kornia.filters.box_blur(edge_masks, kernel_size=(5, 5))
-
+        blurred_edge_masks = kornia.filters.box_blur(
+            edge_masks.unsqueeze(1), kernel_size=(5, 5)
+        ).squeeze(
+            1
+        )  # BxHxW
         # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
         n_uniform = int(n_points * 0.1)
-        n_edge = int(n_points * 0.3)
+        n_edge = int(n_points * 0.7)
         n_blurred_edge = n_points - n_uniform - n_edge  # Remaining for blurred edge
 
         # Generate probability distribution for uniform sampling
@@ -524,7 +528,8 @@ def sample_video_frames_by_args(
     video_frames, n_frames=None, blur_scores=None, differences=None, args=None
 ):
     """
-    Dispatcher function to select the appropriate sampling method based on provided arguments.
+    Function to select the appropriate sampling method based on provided arguments.
+    Supports a couple different weighting strategies for choosing frame
 
     :param video_frames: List of video frames.
     :param n_frames: Total number of frames to sample.
