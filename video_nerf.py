@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import numpy as np
 import kornia
 
+
 from PIL import Image
 
 from models import get_model
@@ -450,9 +451,6 @@ def sample_uniform_with_runs(
     sampled_frames = [video_frames[i] for i in all_indices.tolist()]
 
     return sampled_frames
-
-
-import torch
 
 
 def sample_with_scores_and_runs(
@@ -1026,7 +1024,8 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Enable sampling of long temporal frames.",
-    )
+    )  # some papers argue starting off training with long temporal sampling should help. (I think have many separately spaced runs should be enough)
+    # TODO: Test in ablation
 
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
