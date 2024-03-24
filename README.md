@@ -41,6 +41,7 @@ Currently the code is not running as a did a major overhaul to add all the featu
 #### Training Stability
 
 - [x] Add Loss term on model estimated depth, This allows us to take advantage of a prerained foundation model and bootstrap training
+- [x] Add exponential time series sampling(samples runs of 9 steps at (-8, -4, -2, 1, 0, 1, 2, 4, 8) to train on batches of frames is near proximity.
 
 #### Style Controls
 
