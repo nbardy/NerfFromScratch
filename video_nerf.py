@@ -844,6 +844,18 @@ if __name__ == "__main__":
         default=3,
         help="Number of frames to sample in each cluster.",
     )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.001,
+        help="Learning rate for the optimizer.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.001,
+        help="Weight decay for the optimizer.",
+    )
 
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"

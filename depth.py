@@ -24,7 +24,7 @@ def initialize_model():
 
 def image_depth(image_tensor):
     """
-    Estimate depth from an image tensor.
+    Estimate depth from an image tensor, with added debugging information and normalization.
 
     Args:
     - image_tensor (torch.Tensor): A tensor representation of the image of shape (3, H, W).
@@ -37,6 +37,19 @@ def image_depth(image_tensor):
     # Ensure input is a tensor on the correct device
     if not isinstance(image_tensor, torch.Tensor):
         raise TypeError("Input must be a torch.Tensor")
+
+    # Debugging: Print min and max of the incoming tensor
+    print(
+        f"Incoming tensor min: {image_tensor.min().item()}, max: {image_tensor.max().item()}"
+    )
+
+    # Normalize the tensor to the range [0, 1] if it's not already
+    if image_tensor.min() < 0 or image_tensor.max() > 1:
+        image_tensor = (image_tensor - image_tensor.min()) / (
+            image_tensor.max() - image_tensor.min()
+        )
+        print("Tensor normalized to [0, 1] range.")
+
     if torch.cuda.is_available():
         image_tensor = image_tensor.cuda()  # Move input tensor to GPU if available
 
