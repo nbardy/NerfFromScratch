@@ -4,6 +4,8 @@ from PIL import Image
 from transformers import DPTImageProcessor, DPTForDepthEstimation
 from torchvision.transforms.functional import to_tensor, to_pil_image
 
+from utils import get_default_device
+
 # Global cache for model and processor to avoid reinitialization
 model_cache = {}
 

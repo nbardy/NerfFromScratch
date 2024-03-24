@@ -78,24 +78,6 @@ def deblur_video_vrt(
     )
 
 
-def google_deblur(image_path):
-    """
-    Deblurs an image using the Google MAXIM model.
-    """
-    global model_cache
-    if "google_deblur" not in model_cache:
-        model_cache["google_deblur"] = from_pretrained_keras(
-            "google/maxim-s3-deblurring-reds"
-        )
-    model = model_cache["google_deblur"]
-    image = Image.open(image_path)
-    image = np.array(image)
-    image = tf.convert_to_tensor(image)
-    image = tf.image.resize(image, (256, 256))
-    predictions = model.predict(tf.expand_dims(image, 0))
-    return predictions
-
-
 def image_difference_kornia(image_path1, image_path2):
     """
     Computes the difference between two images using latent representations obtained by a Kornia model.
@@ -121,64 +103,51 @@ def image_difference_kornia(image_path1, image_path2):
     return latent_diff.item()
 
 
-class MobileViTFeatureExtractor(nn.Module):
-    def __init__(self):
-        super(MobileViTFeatureExtractor, self).__init__()
-        self.mobilevit = KC.MobileViT(mode="xxs")
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x):
-        features = self.mobilevit(x)  # BxCxHxW
-        pooled_features = self.pool(features)  # BxCx1x1
-        return pooled_features.flatten(1)  # BxC
+# Loads vdieo as pytorh  frames
+import torch
+import torchvision
 
 
-feature_extractor = MobileViTFeatureExtractor()
+def load_video(video_path, max_frames=float("inf")):
+    video_frames, video_fps = torchvision.io.read_video(video_path)
+    return video_frames, video_fps
 
 
 def video_difference_scores(video_path):
-    cap = cv2.VideoCapture(video_path)
-    ret, prev_frame = cap.read()
-    prev_frame = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2RGB)
-    prev_frame = cv2.resize(prev_frame, (256, 256))
-    prev_frame_tensor = (
-        torch.tensor(prev_frame).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    )  # 1x3x256x256
+    video_frames, _ = load_video(video_path, max_frames=float("inf"))
     differences = []
-    with torch.no_grad():
-        prev_features = feature_extractor(prev_frame_tensor)  # BxC
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (256, 256))
-            frame_tensor = (
-                torch.tensor(frame).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-            )  # 1x3x256x256
-            current_features = feature_extractor(frame_tensor)  # BxC
-            difference = torch.norm(
-                current_features - prev_features, p=2
-            ).item()  # scalar
-            differences.append(difference)
-            prev_features = current_features
-    cap.release()
+    for i in range(len(video_frames) - 1):
+        differences.append(
+            image_difference_kornia(video_frames[i], video_frames[i + 1])
+        )
     return differences
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python preprocess.py <video_path>")
-        sys.exit(1)
-
-    video_path = sys.argv[1]
-    print(f"Processing video: {video_path}")
     start_time = time.time()
 
     # Calculate differences between consecutive frames
+    # download
+    test_video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+    video_path = "ElephantsDream.mp4"
+    print(f"Processing video: {video_path}")
+    if not Path(video_path).exists():
+        download_start_time = time.time()
+        response = requests.get(test_video_url)
+        with open(video_path, "wb") as f:
+            f.write(response.content)
+        download_end_time = time.time()
+        print(
+            f"Download completed in {download_end_time - download_start_time:.2f} seconds."
+        )
+    differences_start_time = time.time()
     differences = video_difference_scores(video_path)
+    differences_end_time = time.time()
+    print(
+        f"Differences calculated in {differences_end_time - differences_start_time:.2f} seconds."
+    )
+    print(f"Differences shape: {len(differences)}")
     end_time = time.time()
-    print(f"Differences: {differences}")
 
     print("Deblurring")
 

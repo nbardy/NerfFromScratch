@@ -18,7 +18,7 @@ from PIL import Image
 
 from models import get_model
 from utils import get_default_device
-from preprocess import blur_scores, video_difference_scores, deblur_video
+from preprocess import blur_scores, video_difference_scores, deblur_video_vrt
 from peft import inject_adapter_in_model, LoraConfig
 
 from depth import image_depth
@@ -365,20 +365,97 @@ def compute_clip_loss(image_features, text_features):
     return loss
 
 
+def exponential_cluster_indices(video_length, n_cluster, cluster_exponential):
+    """
+    Generates indices for clustered sampling with exponential offset pattern.
+
+    :param video_length: Total number of frames in the video.
+    :param n_cluster: Number of frames to sample in each cluster.
+    :param cluster_run_count: Number of runs for the cluster sampling.
+    :param cluster_exponential: Exponential factor for offset increase.
+    :return: A tensor of cluster indices.
+    """
+    cluster_indices = []
+    offset = 0  # Initial offset
+    while len(cluster_indices) < n_cluster:
+        start_index = torch.randint(
+            0, video_length, (1,)
+        ).item()  # Start from any frame
+        # Calculate indices based on the current offset
+        indices = [
+            start_index + i
+            for i in range(-offset, offset + 1)
+            if 0 <= start_index + i < video_length
+        ]
+        cluster_indices.extend(indices)
+        if len(cluster_indices) >= n_cluster:  # Break if we have enough indices
+            break
+        offset = (
+            offset * cluster_exponential if offset else 1
+        )  # Double the offset each time, starting from 1
+    cluster_indices = torch.tensor(cluster_indices)[
+        :n_cluster
+    ]  # Ensure it does not exceed n_cluster
+    return cluster_indices
+
+
+def sample_uniform(video_frames, n_frames, cluster_run_count=9, cluster_exponential=2):
+    """
+    Uniformly samples frames from the video, with optional clustered sampling.
+
+    :param video_frames: List of video frames.
+    :param n_frames: Total number of frames to sample.
+    :param cluster_run_count: Number of runs for the cluster sampling.
+    :param cluster_exponential: Exponential factor for offset increase.
+    :return: A list of sampled frames.
+    """
+    # Uniform random sampling
+    uniform_indices = torch.randperm(len(video_frames))[:n_frames]
+
+    # Clustered sampling with exponential offset pattern
+    cluster_indices = exponential_cluster_indices(
+        len(video_frames), n_frames, cluster_exponential
+    )
+
+    # Combine and deduplicate indices
+    all_indices = torch.cat((uniform_indices, cluster_indices))
+    unique_indices = torch.unique(all_indices)
+
+    # If deduplication leads to fewer frames, sample randomly to fill the gap
+    if len(unique_indices) < n_frames:
+        additional_indices = torch.randperm(len(video_frames))[
+            : n_frames - len(unique_indices)
+        ]
+        unique_indices = torch.unique(torch.cat((unique_indices, additional_indices)))
+
+    # Select frames based on indices
+    sampled_frames = [video_frames[i] for i in unique_indices.tolist()]
+
+    return sampled_frames
+
+
 def sample_with_scores(
-    video_frames, differences, blur_scores, n_frames, sample_clusters
+    video_frames,
+    differences,
+    blur_scores,
+    n_frames,
+    sample_clusters,
+    cluster_run_count=9,
+    cluster_exponential=2,
 ):
     """
-    Samples frames based on uniform random, differences maximized, minimal blur scores, and clustered sampling.
-    Each criterion contributes 30% to the final sample set, except for clustered sampling which is determined by sample_clusters.
+    Samples frames based on uniform, low blur, high differences criteria, and supports clusters for runs in time.
 
     :param video_frames: List of video frames.
     :param differences: List of difference scores between consecutive frames.
     :param blur_scores: List of blur scores for each frame.
     :param n_frames: Total number of frames to sample.
     :param sample_clusters: Number of frames to sample in each cluster.
+    :param cluster_run_count: Number of runs for the cluster sampling.
+    :param cluster_exponential: Exponential factor for offset increase.
     :return: A list of sampled frames.
     """
+
     n_uniform = int(n_frames * 0.3)
     n_diff = int(n_frames * 0.3)
     n_blur = int(n_frames * 0.3)  # Ensures total is exactly n_frames even with rounding
@@ -393,15 +470,10 @@ def sample_with_scores(
     # Sampling based on minimal blur
     blur_indices = torch.argsort(torch.tensor(blur_scores))[:n_blur]
 
-    # Clustered sampling
-    cluster_indices = []
-    for _ in range(n_cluster // sample_clusters):
-        start_index = torch.randint(0, len(video_frames) - sample_clusters, (1,)).item()
-        for i in range(sample_clusters):
-            cluster_indices.append(start_index + i)
-    cluster_indices = torch.tensor(cluster_indices)[
-        :n_cluster
-    ]  # Ensure it does not exceed n_cluster
+    # Clustered sampling with exponential offset pattern
+    cluster_indices = exponential_cluster_indices(
+        len(video_frames), n_cluster, cluster_run_count, cluster_exponential
+    )
 
     # Combine and deduplicate indices
     all_indices = torch.cat(
@@ -420,6 +492,40 @@ def sample_with_scores(
     sampled_frames = [video_frames[i] for i in unique_indices.tolist()]
 
     return sampled_frames
+
+
+def sample_by_args(
+    video_frames, n_frames, blur_scores=None, differences=None, args=None
+):
+    """
+    Dispatcher function to select the appropriate sampling method based on provided arguments.
+
+    :param video_frames: List of video frames.
+    :param n_frames: Total number of frames to sample.
+    :param args: Command line arguments or any other configuration.
+    :return: A list of sampled frames.
+    """
+    if args.weight_blur_and_difference is None or args.weight_blur_and_difference == 0:
+        return sample_uniform(
+            video_frames,
+            n_frames,
+            cluster_run_count=args.time_sample_clusters,
+        )
+    else:
+        assert (
+            blur_scores is not None
+        ), "Blur scores are required for weighted sampling."
+        assert (
+            differences is not None
+        ), "Differences are required for weighted sampling."
+
+        return sample_with_scores(
+            video_frames,
+            differences,
+            blur_scores,
+            n_frames,
+            cluster_run_count=args.time_sample_clusters,
+        )
 
 
 def train_video(
@@ -459,12 +565,8 @@ def train_video(
     depth_maps = [image_depth(video_frames[i].to(device)) for i in range(max_frames)]
 
     for epoch in range(epochs):
-        sampled_frames = sample_with_scores(
-            video_frames,
-            differences,
-            blur_scores,
-            n_frames,
-            sample_clusters=args.time_sample_clusters,
+        sampled_frames = sample_by_args(
+            video_frames, differences, blur_scores, n_frames, args
         )
         batch_camera_poses = []
         batch_rays = []
@@ -738,7 +840,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_points",
         type=int,
-        default=30,
+        default=8000,
         help="Number of points to sample for training",
     )
     parser.add_argument(
@@ -841,7 +943,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--time_sample_clusters",
         type=int,
-        default=3,
+        default=7,
         help="Number of frames to sample in each cluster.",
     )
     parser.add_argument(
@@ -868,7 +970,7 @@ if __name__ == "__main__":
     # preprocess
 
     if args.deblur_video:
-        deblurred_video = deblur_video(video_path)
+        deblurred_video = deblur_video_vrt(video_path)
 
     if args.weight_blur_and_difference:
         blur_scores = blur_scores(video_path)
