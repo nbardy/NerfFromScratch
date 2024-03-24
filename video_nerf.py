@@ -14,7 +14,6 @@ import numpy as np
 import kornia
 
 import torch
-import clip
 from PIL import Image
 
 from models import get_model
@@ -107,14 +106,6 @@ class LearnableCameraPosition(nn.Module):
         return make_camera_rays(position, direction, up_vector, viewport_size=size)
 
 
-image_transform = transforms.Compose(
-    [
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
-
-
 def load_video(filename, max_frames=100):
     cap = cv2.VideoCapture(filename)
     video_frames = []
@@ -125,6 +116,15 @@ def load_video(filename, max_frames=100):
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
         pil_frame = Image.fromarray(frame)
+
+        # Custom image transform without standard normalization
+        image_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),  # Scales to [0, 1]
+                # Optionally resize or apply other transformations here
+            ]
+        )
+
         video_frames.append(image_transform(pil_frame))
         frame_count += 1
     cap.release()
@@ -314,7 +314,7 @@ def compute_style_loss(batch_output, depth_maps, args):
     :param args: Command line arguments or any other configuration holding the text prompts and CLIP model details.
     :return: The computed style loss and a dictionary of individual losses for logging.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_default_device()
     # Utilize provided utility functions for embedding extraction
     image_embeds = embed_image(batch_output.to(device))  # [Batch, Seq_len, Emb_dim]
     depth_map_embeds = embed_text(depth_maps.to(device))  # [Batch, Seq_len, Emb_dim]

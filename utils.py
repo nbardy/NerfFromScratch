@@ -1,9 +1,6 @@
 import torch
 
 
-import torch
-
-
 def get_default_device():
     if torch.backends.mps.is_available():
         # Apple Silicon GPU available

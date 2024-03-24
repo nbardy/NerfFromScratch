@@ -12,7 +12,6 @@ train.py --video demo.mp4
 
 Allow training of a video NERF in 50-60 seconds that allows high quality video stylization
 
-
 #### Current State
 
 Currently the code is not running as a did a major overhaul to add all the features below.

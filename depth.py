@@ -18,8 +18,8 @@ def initialize_model():
             "Intel/dpt-hybrid-midas", low_cpu_mem_usage=True
         )
         model_cache["model"].eval()  # Set model to evaluation mode
-        if torch.cuda.is_available():
-            model_cache["model"].cuda()  # Move model to GPU if available
+        device = get_default_device()  # Utilize get_default_device from utils
+        model_cache["model"].to(device)  # Move model to the default device
 
 
 def image_depth(image_tensor):
@@ -50,12 +50,13 @@ def image_depth(image_tensor):
         )
         print("Tensor normalized to [0, 1] range.")
 
-    if torch.cuda.is_available():
-        image_tensor = image_tensor.cuda()  # Move input tensor to GPU if available
-
-    # Process image tensor and prepare for the model
-    inputs = model_cache["processor"](images=image_tensor, return_tensors="pt")
-    inputs = {k: v.cuda() for k, v in inputs.items()}  # Move inputs to GPU
+    device = image_tensor.device  # Use the device of the input image tensor
+    inputs = model_cache["processor"](
+        images=image_tensor.to(device), return_tensors="pt"
+    )
+    inputs = {
+        k: v.to(device) for k, v in inputs.items()
+    }  # Ensure inputs are on the same device as image_tensor
 
     with torch.no_grad():
         outputs = model_cache["model"](**inputs)

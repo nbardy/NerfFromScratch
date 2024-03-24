@@ -488,12 +488,6 @@ def get_model(model_name, input_dim=6):
         return GaussianFeatureMLP(
             input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0
         )
-    elif model_name == "nerf-former":
-        from nerf_transformer import NERFTransformer
-
-        return NERFTransformer(
-            input_dim=input_dim, output_dim=3, num_tokens=16, inner_dim=64
-        )
     elif model_name == "spacetime-lookup":
 
         return SpaceTimeLookTable(
