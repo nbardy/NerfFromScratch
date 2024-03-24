@@ -36,11 +36,12 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
 
 def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     """
-    Computes the blur score for each frame of a video using Kornia, saves the results as a SafeTensor based on the video file name,
+    Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
     and attempts to load from cache if available. Returns a tensor of scores.
     """
     # Step 1: Hash video frames for cache key
-    video_frames_hash = hash(tuple(video_frames))  # Hash of the frames for unique identification
+    video_frames_bytes = [frame.cpu().numpy().tobytes() for frame in video_frames]  # Convert frames to bytes
+    video_frames_hash = hash(tuple(video_frames_bytes))  # Hash the bytes for a unique identifier
     cache_path = Path(f"cache/{video_frames_hash}_blur_scores.pt")  # Use hash in cache file name
 
     # Step 2: Check if cache exists and load it
@@ -48,11 +49,9 @@ def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
         blur_scores_tensor = torch.load(cache_path)  # Load cached scores if available
     else:
         # Step 3: Compute blur scores if cache does not exist
-        blur_scores_list = []
-        for frame in video_frames:
-            frame_blur_score = compute_blur_score_single_frame(frame.unsqueeze(0))  # Compute blur score for each frame
-            blur_scores_list.append(frame_blur_score)
-        blur_scores_tensor = torch.tensor(blur_scores_list, dtype=torch.float32)  # Convert list to tensor
+        blur_scores_tensor = torch.tensor(
+            [compute_blur_score_single_frame(frame.unsqueeze(0)) for frame in video_frames], dtype=torch.float32
+        )  # Compute and convert list to tensor
 
         # Step 4: Save computed blur scores to cache
         torch.save(blur_scores_tensor, cache_path)  # Save scores to cache for future use
@@ -104,25 +103,75 @@ def deblur_video_vrt(
     return output_folder / Path(video_path).name
 
 
-def image_difference_kornia(image_path1, image_path2):
+import os
+import torch
+from pathlib import Path
+import kornia.feature as KF
+
+
+def load_or_compute_features(image_tensor, vit_model, cache_file):
     """
-    Computes the difference between two images using latent representations obtained by a Kornia model.
+    Load features from cache if exists, else compute using the ViT model and save to cache.
     """
-    transforms = Compose(
-        [
-            Resize((224, 224)),
-            ToTensor(),
-            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
-    image1, image2 = Image.open(image_path1).convert("RGB"), Image.open(image_path2).convert("RGB")
-    image1, image2 = transforms(image1).unsqueeze(0), transforms(image2).unsqueeze(0)  # 1x3x224x224
-    model = resnet18(pretrained=True)
-    model.eval()
-    with torch.no_grad():
-        latent1, latent2 = model(image1), model(image2)
-    latent_diff = torch.norm(latent1 - latent2, p=2)  # scalar
+    if cache_file.exists():
+        features = torch.load(cache_file)
+    else:
+        with torch.no_grad():
+            features = vit_model(image_tensor.to("cuda"))  # Move tensor to GPU for computation
+        torch.save(features.cpu(), cache_file)  # Save features to cache in CPU tensor format
+    return features
+
+
+def image_difference_kornia_tensor(image_tensor1, image_tensor2, cache_dir="cache"):
+    """
+    Computes the difference between two images using cached features extracted by a fast Vision Transformer (ViT) model in Kornia.
+    Accepts two torch tensors as input.
+    """
+    # Ensure cache directory exists
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    # Generate cache filenames based on tensor hash to uniquely identify them
+    cache_file1 = Path(cache_dir) / f"{hash(image_tensor1.numpy().tobytes())}_features.pt"
+    cache_file2 = Path(cache_dir) / f"{hash(image_tensor2.numpy().tobytes())}_features.pt"
+
+    # Initialize the Vision Transformer model from Kornia
+    vit_model = KF.VisionTransformer(pretrained=True, num_classes=1000, img_size=224)
+    vit_model.eval()
+    vit_model.to("cuda")  # Move model to GPU
+
+    # Load or compute features
+    features1 = load_or_compute_features(image_tensor1, vit_model, cache_file1)
+    features2 = load_or_compute_features(image_tensor2, vit_model, cache_file2)
+
+    # Compute the L2 norm difference between the features of the two images
+    latent_diff = torch.norm(features1 - features2, p=2)  # scalar
+
     return latent_diff.item()
+
+
+def unload_image_diff_model():
+    """
+    Clears the image difference model from both CPU and GPU memory.
+    """
+    global model
+    if model is not None:
+        # Move model to CPU and then delete it
+        model.cpu()
+        del model
+        model = None
+        # Explicitly call garbage collector
+        import gc
+
+        gc.collect()
+        # Clear CUDA cache if model was on GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # Explicitly call garbage collector
+        import gc
+
+        gc.collect()
+        # Clear CUDA cache if model was on GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # Loads vdieo as pytorh  frames
@@ -140,7 +189,7 @@ def load_video(video_path, max_frames=None):
 def video_difference_scores(video_frames):
     differences = []
     for i in range(len(video_frames) - 1):
-        differences.append(image_difference_kornia(video_frames[i], video_frames[i + 1]))
+        differences.append(image_difference_kornia_tensor(video_frames[i], video_frames[i + 1]))
     return differences
 
 
@@ -149,15 +198,9 @@ def main():
 
     # Calculate differences between consecutive frames
     # download
-    def load_video_path():
-        """
-        Determines the video path and URL for downloading if necessary.
-        """
-        video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
-        video_path = "ElephantsDream.mp4"
-        return video_url, video_path
-
-    test_video_url, video_path = load_video_path()
+    test_video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+    # download and cache skip ifexist
+    video_path = "ElephantsDream.mp4"
     if not Path(video_path).exists():
         print("downloading")
         download_start_time = time.time()
