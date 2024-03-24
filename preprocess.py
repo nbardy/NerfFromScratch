@@ -36,21 +36,28 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     return blur_score.item()
 
 
-def blur_scores(video_path: str) -> float:
+def blur_scores(video_path: str) -> torch.Tensor:
     """
-    Approximates a wavelet-based motion blur score for a video by averaging the scores of its frames using Kornia.
-    This function now accepts a video path instead of an Image object and uses torch for video loading.
+    Computes the blur score for each frame of a video using Kornia, saves the results as a SafeTensor based on the video file name,
+    and attempts to load from cache if available. Returns a tensor of scores.
     """
-    video = torchvision.io.read_video(video_path, pts_unit="sec")[
-        0
-    ]  # Load video, returns (video_frames, audio, info)
-    video_frames = (
-        video.permute(0, 3, 1, 2).float() / 255.0
-    )  # BxTxHxW to BxCxHxW and normalize
-    blur_scores = [
-        compute_blur_score_single_frame(frame.unsqueeze(0)) for frame in video_frames
-    ]
-    return np.mean(blur_scores) if blur_scores else 0.0
+    cache_path = Path(f"{video_path}.blur_scores.pt")
+    if cache_path.exists():
+        blur_scores_tensor = torch.load(cache_path)  # Load cached scores if available
+    else:
+        video_frames, _, _ = torchvision.io.read_video(
+            video_path, pts_unit="sec"
+        )  # BxTxHxW
+        video_frames = video_frames.permute(0, 3, 1, 2).float() / 255.0  # BxTxCxHxW
+        blur_scores_tensor = torch.tensor(
+            [
+                compute_blur_score_single_frame(frame.unsqueeze(0))
+                for frame in video_frames
+            ],
+            dtype=torch.float32,
+        )
+        torch.save(blur_scores_tensor, cache_path)
+    return blur_scores_tensor
 
 
 def deblur_video_vrt(
