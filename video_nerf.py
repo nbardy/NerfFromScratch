@@ -19,10 +19,17 @@ import torch.nn.functional as F
 import numpy as np
 import kornia
 
+import torch
+import clip
+from PIL import Image
+
 from models import get_model
 from utils import get_default_device
 from preprocess import blur_scores, video_difference_scores, deblur_video
 from peft import inject_adapter_in_model, LoraConfig, enable_adapters, disable_adapters
+
+from depth import image_depth
+from style import embed_for_text, embed_for_image
 
 camera_depth = 0.2
 
@@ -286,70 +293,42 @@ def render_rays(
     return c + 1 - weight_sum.unsqueeze(-1), regularization, depth
 
 
-import torch
-import clip
-from PIL import Image
-
-
 def compute_style_loss(batch_output, depth_maps, args):
     """
     Computes the style loss using CLIP by comparing generated images and depth maps against text prompts.
 
-    :param scene_function_with_lora: The NeRF model with LoRA adapters enabled for style computations.
     :param batch_output: The batch of generated images from the NeRF model.
     :param depth_maps: The batch of generated depth maps from the NeRF model.
     :param args: Command line arguments or any other configuration holding the text prompts and CLIP model details.
-    :return: The computed style loss.
+    :return: The computed style loss and a dictionary of individual losses for logging.
     """
-    # Load the CLIP model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    # Utilize provided utility functions for embedding extraction
+    image_embeds = embed_for_image(batch_output.to(device))
+    depth_map_embeds = embed_for_text(depth_maps.to(device))
 
-    # Prepare the text prompts
-    text_prompts = [
-        "A depth map.",
-        f"A depth map, {args.style_prompt}",
-    ]  # Example prompts
-    text_tokens = clip.tokenize(text_prompts).to(device)
+    loss_dict = {}
+    total_loss = 0.0
 
-    # Compute text features
-    with torch.no_grad():
-        text_features = clip_model.encode_text(text_tokens)
+    # Process geometry style text prompts
+    if args.geo_style_text:
+        geo_text_embeds = embed_for_text(
+            ["A depth map.", f"A depth map, {args.style_prompt}"], device
+        )
+        geo_loss = F.cross_entropy(geo_text_embeds, depth_map_embeds)
+        total_loss += args.scale_geo * geo_loss
+        loss_dict["geo_loss"] = geo_loss.item()
+
+    # Process clip style text prompts
+    if args.clip_style_text:
+        style_text_embeds = embed_for_text([args.clip_style_text], device)
+        style_loss = F.cross_entropy(style_text_embeds, image_embeds)
+        total_loss += args.scale_style * style_loss
+        loss_dict["style_loss"] = style_loss.item()
+
+    return total_loss, loss_dict
 
     # Initialize style loss
-    style_loss = 0.0
-
-    # Compute CLIP loss for depth maps
-    for depth_map in depth_maps:
-        depth_image = Image.fromarray(
-            (depth_map.cpu().numpy() * 255).astype(np.uint8)
-        ).convert("RGB")
-        depth_image_preprocessed = preprocess(depth_image).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            depth_image_features = clip_model.encode_image(depth_image_preprocessed)
-
-        depth_loss = compute_clip_loss(depth_image_features, text_features)
-        style_loss += depth_loss
-
-    # Compute CLIP loss for generated images
-    for generated_image in batch_output:
-        generated_image_preprocessed = (
-            preprocess(generated_image).unsqueeze(0).to(device)
-        )
-
-        with torch.no_grad():
-            generated_image_features = clip_model.encode_image(
-                generated_image_preprocessed
-            )
-
-        image_loss = compute_clip_loss(generated_image_features, text_features)
-        style_loss += image_loss
-
-    # Normalize the style loss
-    style_loss /= len(depth_maps) + len(batch_output)
-
-    return style_loss
 
 
 def compute_clip_loss(image_features, text_features):
@@ -378,34 +357,15 @@ def train_video(
     n_points=5,
     n_frames=10,
     max_frames=None,
-    blur_scores=None,
-    differences=None,
-    args=None,  # Add args to access enable_entropy_loss flag
+    args=None,
 ):
     assert max_frames is not None
+    assert args is not None
+
     wandb.init(project="3D_nerf")
 
     camera_position = LearnableCameraPosition(n_frames=n_frames)
     scene_function = get_model(args.model)
-
-    should_compute_style_loss = (
-        args.geo_style_text
-        or args.geo_style_image
-        or args.clip_style_text
-        or args.clip_style_image
-    )
-
-    # Configure LoRA
-    lora_config = LoraConfig(
-        lora_alpha=16,
-        lora_dropout=0.1,
-        r=args.lora_rank,
-        bias="none",
-        target_modules=["linear"],
-    )
-
-    # Inject LoRA adapters into the scene function model for style-related computations
-    scene_function_with_lora = inject_adapter_in_model(lora_config, scene_function)
 
     optimizer = torch.optim.Adam(
         scene_function.parameters(),
@@ -415,7 +375,6 @@ def train_video(
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     device = get_default_device()
-    # Load and preprocess image on the correct device
     video_frames, max_frames = load_video(video_path, max_frames=max_frames)
     size = video_frames[0].shape
     size = [size[1], size[2]]
@@ -424,14 +383,7 @@ def train_video(
     camera_position.to(device)
 
     for epoch in range(epochs):
-
-        # Create a batch of training data by taking a random set of frames
-        # and sampling a random set of points from each frame
-
-        # TODO: Make it repeat in a cycle to sample points evenly
         random_frame_indices = torch.randint(0, len(video_frames), (n_frames,))
-
-        # Accumulate samples over many frames
         batch_camera_poses = []
         batch_rays = []
         batch_t = []
@@ -439,11 +391,9 @@ def train_video(
 
         for i in range(n_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=i)
-
             frame_index = random_frame_indices[i]
             random_frame = video_frames[frame_index].to(device)
 
-            # Sample n random points from the camera_rays and the same number of points from the image
             sampled_colors, sampled_poses, sampled_rays = sample_n_points_from_tensors(
                 [random_frame, camera_poses, camera_rays],
                 n_points,
@@ -455,47 +405,32 @@ def train_video(
             batch_rays.append(sampled_rays)
             batch_output.append(sampled_colors)
 
-            # Append timestep
             t = frame_index / max_frames
             t = torch.ones(n_points, 1) * t
             t = t.to(device)
-
             batch_t.append(t)
 
-        # Stack the batch
         batch_camera_poses = torch.cat(batch_camera_poses, dim=0)
         batch_rays = torch.cat(batch_rays, dim=0)
         batch_output = torch.cat(batch_output, dim=0)
         batch_t = torch.cat(batch_t, dim=0)
 
-        loss_value = 0
-        if args.train_base_model:
-            disable_adapters(scene_function_with_lora)
-            generated_colors, entropy_regularization, depth = render_rays(
-                scene_function,
-                batch_camera_poses,
-                batch_rays,
-                batch_t,
-                near,
-                far,
-                num_samples_ray_samples,
-                args=args,  # Pass args to access enable_entropy_loss flag
-            )
+        generated_colors, entropy_regularization, depth = render_rays(
+            scene_function,
+            batch_camera_poses,
+            batch_rays,
+            batch_t,
+            near,
+            far,
+            num_samples_ray_samples,
+            args=args,
+        )
 
-            # Compute base losses (e.g., MSE, depth) using the original scene_function without LoRA
-            loss = nn.HuberLoss()
-            base_loss = loss(generated_colors, batch_output) + entropy_regularization
-            loss_value += base_loss
-
-        # Enable LoRA adapters for style loss computation
-        if should_compute_style_loss:
-            enable_adapters(scene_function_with_lora)
-            # Assuming compute_style_loss is a function that computes the style loss
-            style_loss = compute_style_loss(batch_output, depth, args)
-            loss_value += style_loss
+        loss = nn.HuberLoss()
+        base_loss = loss(generated_colors, batch_output) + entropy_regularization
 
         optimizer.zero_grad()
-        loss_value.backward()
+        base_loss.backward()
         optimizer.step()
         scheduler.step()
 
@@ -512,24 +447,94 @@ def train_video(
                 )
             )
 
-        # TODO: Re-enable and debug video render
-        # if epoch % args.video_validation_steps == 0:
-        #     log_data.update(
-        #         log_video(
-        #             scene_function,
-        #             video_frames,
-        #             camera_position,
-        #             size,
-        #             max_frames,
-        #             device,
-        #         )
-        #     )
-
-        log_data["total loss"] = loss_value.item()
-        log_data["base loss"] = base_loss.item()
-        if should_compute_style_loss:
-            log_data["style loss"] = style_loss.item()
+        log_data["total loss"] = base_loss.item()
         log_data["learning rate"] = scheduler.get_last_lr()[0]
+        wandb.log(log_data)
+
+
+def train_style_video(
+    video_path,
+    epochs=5,
+    args=None,
+):
+    assert (
+        args.clip_style_image
+        or args.clip_style_text
+        or args.geo_style_image
+        or args.geo_style_text
+    ), "Style training requires CLIP style image or text."
+
+    wandb.init(project="3D_nerf")
+
+    camera_position = LearnableCameraPosition(
+        n_frames=1
+    )  # Single frame for style training
+    scene_function = get_model(args.model)
+
+    # Configure LoRA
+    lora_config = LoraConfig(
+        lora_alpha=16,
+        lora_dropout=0.1,
+        r=args.lora_rank,
+        bias="none",
+        target_modules=["linear"],
+    )
+    scene_function_with_lora = inject_adapter_in_model(lora_config, scene_function)
+
+    # Filter parameters to only include those from LoRA layers for optimization
+    lora_params = [
+        p for n, p in scene_function_with_lora.named_parameters() if "lora" in n
+    ]
+
+    optimizer = torch.optim.Adam(
+        lora_params,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    device = get_default_device()
+    video_frames, _ = load_video(
+        video_path, max_frames=1
+    )  # Only load a single frame for style training
+    size = [384, 384]  # Fixed resolution for CLIP model
+
+    scene_function_with_lora.to(device)
+    camera_position.to(device)
+
+    for epoch in range(epochs):
+        enable_adapters(scene_function_with_lora)
+        frame_index = 0  # Always use the first frame for style training
+        frame = video_frames[frame_index].to(device)
+        frame = torch.nn.functional.interpolate(
+            frame.unsqueeze(0), size=size, mode="bilinear", align_corners=False
+        ).squeeze(0)
+
+        camera_poses, camera_rays = camera_position.get_rays(
+            size=size, frame_idx=frame_index
+        )
+        generated_colors, _, depth = render_rays(
+            scene_function_with_lora,
+            camera_poses,
+            camera_rays,
+            torch.zeros(1, 1).to(device),  # Dummy batch_t for compatibility
+            near,
+            far,
+            num_samples_ray_samples,
+            args=args,
+        )
+
+        style_loss = compute_style_loss(generated_colors, depth, args)
+
+        optimizer.zero_grad()
+        style_loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        log_data = {
+            "style loss": style_loss.item(),
+            "learning rate": scheduler.get_last_lr()[0],
+        }
         wandb.log(log_data)
 
 
