@@ -212,30 +212,42 @@ class GeometricProjectionMLP(nn.Module):
     A small MLP for projecting 3D points into a new 3D space
 
     This represents a small learned geometric projection model. We use this to project arbitrary points in our 3D space
-    to a cube coordinate system.
+    to a cube coordinate system. We need an evenly spaced cube to use our lookup table effectively.
 
-    This allows us to compress arbitrary points in 3D space into a fixed size lookuptable
+    To do this, we encode two MLPs:
+    1. A residual MLP to emit new 3-dimensional spherical coordinates (alpha, beta, distance) with optional time (t),
+       using only linear transformations to preserve the spherical coordinate information.
+    2. A feature MLP that processes the original coordinates (x, y, z) with non-linear transformations for enhanced representation.
+       (This should capture more local granular information)
+
+    The outputs of these MLPs are combined and passed through a sigmoid to compress arbitrary points in 3D space into a fixed size lookup table.
     """
 
     def __init__(self, has_t=False):
         super(GeometricProjectionMLP, self).__init__()
         self.origin = nn.Parameter(torch.zeros(3))  # Learnable origin
         self.has_t = has_t
-        input_dim = 7 if has_t else 6  # x, y, z, alpha, beta, d, (optional t)
+        # Define dimensions
+        residual_input_dim = 4 if has_t else 3  # alpha, beta, d, (optional t)
+        feature_input_dim = 6 if has_t else 3  # x, y, z, (optional t)
         hidden_dim = 14
-        self.mlp = nn.Sequential(
-            RMSNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, 3),
+
+        # Residual MLP for spherical coordinates
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(residual_input_dim, hidden_dim),
+            nn.Linear(hidden_dim, 3),
         )
 
-        # sigmoid for 0 - 1
+        # Feature MLP for original coordinates with non-linearity
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(feature_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+        # Sigmoid for 0 - 1
         self.sigmoid = nn.Sigmoid()
 
-        # Projects to x, y, z
-
-    # Computes radial feature does a tiny MLP to project back to a cube coordinate
     def forward(self, x, t=None):
         if self.has_t and t is None:
             raise ValueError(
@@ -248,16 +260,24 @@ class GeometricProjectionMLP(nn.Module):
             -1, 1
         )
         beta = torch.acos((x[:, 2] - self.origin[2]) / distance).view(-1, 1)
-        # Concatenate original coordinates with spherical coordinates
-        x = torch.cat([x, alpha, beta, distance], dim=1)
+
+        # Prepare inputs for the MLPs
+        spherical_residual_input = torch.cat([alpha, beta, distance], dim=1)
         if self.has_t:
             t = t.view(-1, 1)  # Ensure t is correctly shaped
-            x = torch.cat([x, t], dim=1)  # Append time if applicable
-        # Project to new 3D space
-        x = self.mlp(x)
-        x = self.sigmoid(x)  # Apply sigmoid to project outputs to the range [0, 1]
+            spherical_residual_input = torch.cat(
+                [spherical_residual_input, t], dim=1
+            )  # Append time if applicable
+        feature_input = torch.cat([x, t], dim=1) if self.has_t else x
 
-        return x
+        # Process through MLPs
+        spherical_residual_output = self.residual_mlp(spherical_residual_input)
+        feature_output = self.feature_mlp(feature_input)
+
+        # Combine outputs and apply sigmoid
+        combined_output = self.sigmoid(spherical_residual_output + feature_output)
+
+        return combined_output
 
 
 # This crosses offset lists of 3D and 4D space and time
@@ -293,7 +313,6 @@ def generate_space_time_offsets(spatial_offsets, temporal_offsets):
 # we use a nearest neighbor lookup for the temporal dimensions to expand the feature size at
 # inference time
 class SpaceTimeLookTable(nn.Module):
-
     face_directions = [
         (1, 0, 0),
         (-1, 0, 0),

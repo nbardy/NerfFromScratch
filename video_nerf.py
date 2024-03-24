@@ -420,6 +420,8 @@ def sample_uniform_with_runs(
     :param cluster_exponential: Exponential factor for offset increase.
     :return: A tensor of sampled frames in the shape of [n_frames, C, H, W].
     """
+
+    print(video_frames.shape)
     assert (
         video_frames.dim() == 4
     ), "video_frames must be a 4D tensor [num_frames, C, H, W]"
@@ -518,6 +520,11 @@ def sample_by_args(
     """
     assert args is not None, "Command line arguments or configuration must be provided."
 
+    # riase error type of video frames is wrong
+    # if not isinstance(video_frames, list):
+    #     raise Start here
+    #     raise TypeError("video_frames must be a list of video frames")
+
     if not args.weight_blur_and_difference:
         return sample_uniform_with_runs(
             video_frames,
@@ -562,6 +569,8 @@ def train_video(
     optimizer = torch.optim.Adam(
         scene_function.parameters(),
         lr=args.lr,
+        betas=(0.99, 0.999),
+        eps=1e-12,
         weight_decay=args.weight_decay,
     )
 
