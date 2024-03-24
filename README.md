@@ -10,7 +10,7 @@ Be able to run a single script
 train.py --video demo.mp4
 ```
 
-And have a nerf train in 50-60 seconds that allows high quality stylization
+Allow training of a video NERF in 50-60 seconds that allows high quality video stylization
 
 Video
 
@@ -34,6 +34,10 @@ Models
 - [x] Add fast mobile transformer instead of MLP[In progess]
 - [x] Lookup table inspired by instantNGP
 
+Training Stability
+
+- [x] Add Loss term on foundation text model to speed up training and provide knowledge transfer from large foundation model pretrains
+
 Style(TODO)
 
 - [ ] CLIP based pixel style loss
@@ -43,4 +47,5 @@ Training Speedups
 
 - [x] Shoot more rays at edges in images (TODO: Add paper ref)
 - [x] Regularize loss over empty space from InfoNERF(ignore KL loss from infoNERF)
-- [ ] Use fast lookup tables nvidia Instant NGP(special cuda kernels)
+- [x] Use fast lookup tables inspired by nvidia Instant NGP
+- [] (TODO): Use actual CUDA kernels from instant-NGP(Although these won't be spacetime compatible)(The torch tables may be fast enough)
