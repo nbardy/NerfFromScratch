@@ -18,10 +18,14 @@ import cv2
 
 import numpy as np
 
+import torch
+import kornia
+
+
 from models import get_model
 from utils import get_default_device
 
-from models import MultiPathGaussianMLP
+from models import MultiPathGaussianMLP, SpaceTimeStepLookTable
 
 
 camera_depth = 0.2
@@ -132,66 +136,80 @@ def load_video(filename, max_frames=100):
 
 ## Samples a subset of the points from a set of tensors
 # We use this to train
-def sample_n_points_from_tensors(image_tensors, n_points, viewport_size):
-    # Ensure all tensors have the same spatial dimensions
-    assert all(
-        tensor.shape[1:] == image_tensors[0].shape[1:] for tensor in image_tensors
-    ), (
-        "All tensors must have the same spatial dimensions, but got shapes: \n"
-        + "\n".join([str(tensor.shape) for tensor in image_tensors])
-    )
+
+
+def normalize_edge_detection(tensor):
+    """
+    Applies Sobel filter for edge detection and normalizes the result to a 0-1 range.
+    """
+    edge_mask = kornia.filters.sobel(
+        tensor.mean(dim=0, keepdim=True), normalized=True, eps=1e-6
+    )  # Apply Sobel filter
+    edge_mask_normalized = (edge_mask - edge_mask.min()) / (
+        edge_mask.max() - edge_mask.min()
+    )  # Normalize to 0-1 range
+    return edge_mask_normalized.squeeze()
+
+
+def sample_indices(prob_dist, n_samples, total_pixels):
+    # Flatten the probability distribution
+    prob_dist_flat = prob_dist.view(-1)
+    # Sample indices based on the probability distribution without replacement
+    indices = torch.multinomial(prob_dist_flat, n_samples, replacement=False)
+    return indices
+
+
+def sample_n_points_from_tensors(
+    image_tensors, n_points, viewport_size, boost_edge=False
+):
     total_pixels = viewport_size[0] * viewport_size[1]
+    sampled_values = []
 
-    # Generate n random indices within the range of total pixels
-    indices = torch.randint(0, total_pixels, (n_points,))
+    for tensor in image_tensors:
+        if boost_edge:
+            # Edge detection and normalization
+            edge_mask = normalize_edge_detection(tensor)
+            blurred_edge_mask = kornia.filters.box_blur(
+                edge_mask.unsqueeze(0), kernel_size=(5, 5)
+            ).squeeze()
 
-    # Convert flat indices to 2D coordinates
-    y_coords = indices // viewport_size[1]
-    x_coords = indices % viewport_size[1]
+            # Sampling based on probability distribution
+            n_uniform = n_points // 3
+            n_edge = n_points // 3
+            n_blurred_edge = n_points - n_uniform - n_edge
 
-    # Sample colors from each tensor using the generated indices
-    sampled_values = [tensor[:, y_coords, x_coords] for tensor in image_tensors]
-    # Move the batch to the last dim for each tensor go from
-    # Dims should go from [D, N] to [N, D]
-    # Don't use permute use swap
-    sampled_values = [v.swapaxes(0, 1) for v in sampled_values]
+            # Generate probability distribution for uniform sampling
+            uniform_prob_dist = torch.ones(total_pixels) / total_pixels
+            # Sample indices for each distribution
+            uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)
+            edge_indices = sample_indices(edge_mask, n_edge, total_pixels)
+            blurred_edge_indices = sample_indices(
+                blurred_edge_mask, n_blurred_edge, total_pixels
+            )
+
+            # Combine and shuffle indices
+            combined_indices = torch.cat(
+                (uniform_indices, edge_indices, blurred_edge_indices)
+            )
+            combined_indices = combined_indices[
+                torch.randperm(combined_indices.size(0))
+            ]
+        else:
+            # Uniform sampling
+            uniform_prob_dist = torch.ones(total_pixels) / total_pixels
+            combined_indices = sample_indices(uniform_prob_dist, n_points, total_pixels)
+
+        # Convert flat indices to 2D coordinates
+        y_coords = combined_indices // viewport_size[1]
+        x_coords = combined_indices % viewport_size[1]
+
+        # Sample colors from tensor using the generated indices
+        sampled_tensor_values = tensor[:, y_coords, x_coords]
+        # Move the batch to the last dim
+        sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)
+        sampled_values.append(sampled_tensor_values)
 
     return sampled_values
-
-
-def loss(x, y):
-    loss = torch.nn.MSELoss()
-    return loss(x, y)
-
-
-def sample_points_along_rays(ray_origins, ray_directions, near, far, num_samples):
-    # Use the device from ray_origins to ensure consistency
-    device = ray_origins.device
-    # Linearly spaced samples along each ray
-    depths = torch.linspace(near, far, num_samples, device=device)
-    depths = depths.expand(ray_origins.shape[0], num_samples)
-
-    # Perturb depths for each ray to sample points at irregular intervals
-    perturbations = torch.rand_like(depths) * (far - near) / num_samples
-    depths += perturbations
-
-    # Compute 3D positions of sampled points along each ray
-    ray_samples = (
-        ray_origins[:, None, :] + ray_directions[:, None, :] * depths[..., None]
-    )
-
-    return ray_samples, depths
-
-
-def compute_transmittance(alphas):
-    accumulated_transmittance = torch.cumprod(alphas, 1)
-    return torch.cat(
-        (
-            torch.ones((accumulated_transmittance.shape[0], 1), device=alphas.device),
-            accumulated_transmittance[:, :-1],
-        ),
-        dim=-1,
-    )
 
 
 # NOTE: Input timestep is for temporal time of the video
@@ -252,13 +270,21 @@ def render_rays(
     return accumulated_colors
 
 
-def train_video(video_path, epochs=5, n_points=5, n_frames=10, max_frames=None):
+def train_video(
+    video_path,
+    epochs=5,
+    n_points=5,
+    n_frames=10,
+    max_frames=None,
+    blur_scores=None,
+    differences=None,
+):
     assert max_frames is not None
     wandb.init(project="3D_nerf")
 
     camera_position = LearnableCameraPosition(n_frames=n_frames)
     # scene_function = get_model(args.model, input_dim=7)
-    scene_function = MultiPathGaussianMLP()
+    scene_function = SpaceTimeStepLookTable()
 
     optimizer = torch.optim.Adam(
         list(scene_function.parameters()) + list(camera_position.parameters()),
@@ -483,23 +509,49 @@ if __name__ == "__main__":
         default=5,
         help="Maximum number of frames to use for training and inference.",
     )
+    parser.add_argument(
+        "--video_path", type=str, required=True, help="Path to the input video."
+    )
+    parser.add_argument(
+        "--deblur_video", action="store_true", help="Enable video deblurring."
+    )
+    parser.add_argument(
+        "--weight_blur_and_difference",
+        action="store_true",
+        help="Enable weighted frame sampling based on blur and difference.",
+    )
 
     args = parser.parse_args()
+    video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
 
     # pretty print args with names
     print("Argumnets")
     for arg in vars(args):
         print(f"{arg}: {getattr(args, arg)}")
 
-    # Launch train
+    # preprocess
+    from preprocess import get_blur_scores, get_differences, deblur_video
 
-    video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
+    if args.deblur_video:
+        deblurred_video = deblur_video(video_path)
 
-    # Detect size from file
+    if args.weight_blur_and_difference:
+        blur_scores = get_blur_scores(video_path)
+        differences = get_differences(video_path)
+        # else none
+    else:
+        blur_scores = None
+        differences = None
+
+    # Launch training with deblurred video if enabled, otherwise use original video path
+    video_to_train = deblurred_video if args.deblur_video else video_path
+
     train_video(
-        video_path,
+        video_to_train,
         epochs=args.epochs,
         n_points=args.n_points,
         n_frames=args.n_frames,
         max_frames=args.max_frames,
+        blur_scores=blur_scores,
+        differences=differences,
     )

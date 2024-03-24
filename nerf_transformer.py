@@ -2,6 +2,12 @@
 # A mostly standard transformer that uses feature embeddings
 # to work for small inputs
 
+# This experiment was moderately successful but classic transofrmers are too
+# hungry for data(making them great for LLMs but bad NERFs
+
+# Will move to instantNGP + MLP and try mobilenet.
+# for NLP replacement
+
 import torch
 import torch.nn as nn
 
