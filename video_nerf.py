@@ -178,8 +178,8 @@ def sample_n_points_from_tensors(
             1
         )  # BxHxW
         # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
-        n_uniform = int(n_points * 0.1)
-        n_edge = int(n_points * 0.7)
+        n_uniform = int(n_points * 0.05)
+        n_edge = int(n_points * 0.9)
         n_blurred_edge = n_points - n_uniform - n_edge  # Remaining for blurred edge
 
         # Generate probability distribution for uniform sampling
@@ -598,8 +598,9 @@ def train_video(
     optimizer = torch.optim.Adam(
         scene_function.parameters(),
         lr=args.lr,
-        betas=(0.99, 0.999),
-        eps=1e-12,
+        # low Eps, high betas and small weight decay to train the lookup tables acording to instant ngp
+        betas=(0.99, 0.99999),
+        eps=1e-9,
         weight_decay=args.weight_decay,
     )
 
@@ -1007,7 +1008,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight_decay",
         type=float,
-        default=0.001,
+        default=0.0001,
         help="Weight decay for the optimizer.",
     )
     parser.add_argument(
@@ -1016,7 +1017,6 @@ if __name__ == "__main__":
         default=False,
         help="Enable sampling of long temporal frames.",
     )  # some papers argue starting off training with long temporal sampling should help. (I think have many separately spaced runs should be enough)
-    # TODO: Test in ablation
 
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
