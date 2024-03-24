@@ -159,7 +159,10 @@ def sample_indices(prob_dist, n_samples, total_pixels):
 
 
 def sample_n_points_from_tensors(
-    image_tensors, n_points, viewport_size, boost_edge=False, k_length_clusters=1
+    image_tensors,
+    n_points,
+    viewport_size,
+    boost_edge=False,
 ):
     total_pixels = viewport_size[0] * viewport_size[1]
     sampled_values = []
@@ -168,9 +171,7 @@ def sample_n_points_from_tensors(
         # Edge detection and normalization for all tensors in the batch
         stacked_tensors = torch.stack(image_tensors)  # BxCxHxW
         edge_masks = normalize_edge_detection(stacked_tensors)  # BxHxW
-        blurred_edge_masks = kornia.filters.box_blur(
-            edge_masks, kernel_size=(5, 5)),
-)
+        blurred_edge_masks = kornia.filters.box_blur(edge_masks, kernel_size=(5, 5))
 
         # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
         n_uniform = int(n_points * 0.1)
@@ -197,29 +198,10 @@ def sample_n_points_from_tensors(
         combined_indices = torch.cat(
             (uniform_indices, edge_indices, blurred_edge_indices)
         )
-        combined_indices = combined_indices[torch.randperm(combined_indices.size(0))]
     else:
         # Uniform sampling
         uniform_prob_dist = torch.ones(total_pixels) / total_pixels
         combined_indices = sample_indices(uniform_prob_dist, n_points, total_pixels)
-
-    # Cluster sampling
-    if k_length_clusters > 1:
-        cluster_indices = []
-        n_clusters = n_points // k_length_clusters
-        for _ in range(n_clusters):
-            start_index = torch.randint(
-                0, total_pixels - k_length_clusters + 1, (1,)
-            ).item()
-            cluster_indices.extend([start_index + i for i in range(k_length_clusters)])
-        if len(cluster_indices) < n_points:
-            additional_indices = torch.randint(
-                0, total_pixels, (n_points - len(cluster_indices),)
-            )
-            cluster_indices = torch.cat(
-                (torch.tensor(cluster_indices), additional_indices)
-            )
-        combined_indices = cluster_indices[:n_points]
 
     # Convert flat indices to 2D coordinates
     y_coords = combined_indices // viewport_size[1]
@@ -654,7 +636,6 @@ def train_video(
                     n_points,
                     size,
                     boost_edge=args.boost_edge,
-                    k_length_clusters=args.space_sample_cluster,
                 )
             )
 
@@ -668,6 +649,7 @@ def train_video(
             t = t.to(device)
             batch_t.append(t)
 
+        # Render all rats as a giant batch
         batch_camera_poses = torch.cat(batch_camera_poses, dim=0)
         batch_rays = torch.cat(batch_rays, dim=0)
         batch_output = torch.cat(batch_output, dim=0)
@@ -989,13 +971,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--scale_entropy_loss",
         type=float,
-        default=1.0,
+        default=0.2,
         help="Scaling factor for entropy loss.",
     )
     parser.add_argument(
         "--scale_depth_loss",
         type=float,
-        default=1.0,
+        default=0.3,
         help="Scaling factor for depth loss.",
     )
     parser.add_argument(
@@ -1004,12 +986,6 @@ if __name__ == "__main__":
         default="mse",
         choices=["mse", "huber"],
         help="Type of loss function to use for base loss.",
-    )
-    parser.add_argument(
-        "--space_sample_cluster",
-        type=int,
-        default=10,
-        help="Number of frames to sample in each cluster.",
     )
     parser.add_argument(
         "--time_sample_clusters",
