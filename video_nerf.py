@@ -139,13 +139,15 @@ def normalize_edge_detection(tensor):
     """
     Applies Sobel filter for edge detection and normalizes the result to a 0-1 range.
     """
+    print(f"Input tensor size: {tensor.size()}")  # Print input tensor size
+    # Compute the mean across the batch dimension and apply Sobel filter with normalization
     edge_mask = kornia.filters.sobel(
         tensor.mean(dim=0, keepdim=True), normalized=True, eps=1e-6
-    )  # Apply Sobel filter
-    edge_mask_normalized = (edge_mask - edge_mask.min()) / (
-        edge_mask.max() - edge_mask.min()
-    )  # Normalize to 0-1 range
-    return edge_mask_normalized.squeeze()
+    )  # 1xCxHxW
+    # Normalize the edge mask to have values between 0 and 1
+    min_val, max_val = edge_mask.min(), edge_mask.max()
+    edge_mask_normalized = (edge_mask - min_val) / (max_val - min_val)  # 1xCxHxW
+    return edge_mask_normalized.squeeze()  # HxW
 
 
 def sample_indices(prob_dist, n_samples, total_pixels):
@@ -163,16 +165,12 @@ def sample_n_points_from_tensors(
     sampled_values = []
 
     if boost_edge:
-        # Edge detection and normalization for the first tensor as a reference
-        edge_mask = normalize_edge_detection(image_tensors[0])
-        blurred_edge_mask = kornia.filters.box_blur(
-            edge_mask.unsqueeze(0), kernel_size=(5, 5)
-        ).squeeze()  # BxHxW
-
-        # Sampling based on probability distribution
-        n_uniform = n_points // 3
-        n_edge = n_points // 3
-        n_blurred_edge = n_points - n_uniform - n_edge
+        # Edge detection and normalization for all tensors in the batch
+        stacked_tensors = torch.stack(image_tensors)  # BxCxHxW
+        edge_masks = normalize_edge_detection(stacked_tensors)  # BxHxW
+        blurred_edge_masks = kornia.filters.box_blur(
+            edge_masks, kernel_size=(5, 5)),
+)
 
         # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
         n_uniform = int(n_points * 0.1)
@@ -181,11 +179,18 @@ def sample_n_points_from_tensors(
 
         # Generate probability distribution for uniform sampling
         uniform_prob_dist = torch.ones(total_pixels) / total_pixels
-        # Sample indices for each distribution with updated ratios
         uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)
-        edge_indices = sample_indices(edge_mask, n_edge, total_pixels)
+
+        # Weighted sampling for edge and blurred edge based on edge detection per frame
+        edge_weights = edge_masks.view(edge_masks.size(0), -1).mean(dim=1)  # B
+        blurred_edge_weights = blurred_edge_masks.view(
+            blurred_edge_masks.size(0), -1
+        ).mean(
+            dim=1
+        )  # B
+        edge_indices = sample_indices(edge_weights, n_edge, total_pixels)
         blurred_edge_indices = sample_indices(
-            blurred_edge_mask, n_blurred_edge, total_pixels
+            blurred_edge_weights, n_blurred_edge, total_pixels
         )
 
         # Combine and shuffle indices
@@ -450,7 +455,7 @@ def sample_uniform_with_runs(
 
     sampled_frames = [video_frames[i] for i in all_indices.tolist()]
 
-    return sampled_frames
+    return sampled_frames, all_indices
 
 
 def sample_with_scores_and_runs(
@@ -530,7 +535,7 @@ def sample_with_scores_and_runs(
     # Select frames based on indices
     sampled_frames = [video_frames[i] for i in unique_indices.tolist()]
 
-    return sampled_frames
+    return sampled_frames, unique_indices
 
 
 def sample_by_args(
@@ -548,12 +553,14 @@ def sample_by_args(
     assert isinstance(video_frames, list), "video_frames must be a list of video frames"
 
     sampled_frames = []
+    indices = []
     if not args.weight_blur_and_difference:
-        sampled_frames = sample_uniform_with_runs(
+        sampled_frames, sampled_indices = sample_uniform_with_runs(
             video_frames,
             n_frames,
             cluster_run_count=args.time_sample_clusters,
         )
+        indices += sampled_indices
     else:
         assert (
             blur_scores is not None
@@ -562,13 +569,14 @@ def sample_by_args(
             differences is not None
         ), "Differences are required for weighted sampling."
 
-        sampled_frames = sample_with_scores_and_runs(
+        sampled_frames, sampled_indices = sample_with_scores_and_runs(
             video_frames,
             differences,
             blur_scores,
             n_frames,
             cluster_run_count=args.time_sample_clusters,
         )
+        indices += sampled_indices
 
     if args.sample_long_temporal:
         long_temporal_indices = sample_exponential_clusters(
@@ -576,8 +584,10 @@ def sample_by_args(
         )
         long_temporal_frames = [video_frames[i] for i in long_temporal_indices.tolist()]
         sampled_frames += long_temporal_frames
+        indices += long_temporal_indices
 
-    return sampled_frames
+    # also indices
+    return sampled_frames, indices
 
 
 def train_video(
@@ -619,7 +629,7 @@ def train_video(
     depth_maps = [image_depth(video_frames[i].to(device)) for i in range(max_frames)]
 
     for epoch in range(epochs):
-        sampled_frames = sample_by_args(
+        sampled_frames, sampled_indices = sample_by_args(
             video_frames,
             n_frames=n_frames,
             differences=differences,
@@ -632,11 +642,13 @@ def train_video(
         batch_output = []
         batch_depth = []
 
-        for i, frame in enumerate(sampled_frames):
-            camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=i)
-            frame_depth_estimate = depth_maps[frame].to(device)  # 1xHxW
+        for frame_index, frame in zip(sampled_indices, sampled_frames):
+            camera_poses, camera_rays = camera_position.get_rays(
+                size=size, frame_idx=frame_index
+            )
+            frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            sampled_colors, sampled_poses, sampled_rays, sampled_depths = (
+            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = (
                 sample_n_points_from_tensors(
                     [frame, camera_poses, camera_rays, frame_depth_estimate],
                     n_points,
@@ -649,7 +661,7 @@ def train_video(
             batch_camera_poses.append(sampled_poses)
             batch_rays.append(sampled_rays)
             batch_output.append(sampled_colors)
-            batch_depth.append(sampled_depths)
+            batch_depth.append(sampled_depth_estimates)
 
             t = video_frames.index(frame) / max_frames
             t = torch.ones(n_points, 1) * t
