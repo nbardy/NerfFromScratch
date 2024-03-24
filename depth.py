@@ -6,6 +6,11 @@ from torchvision.transforms.functional import to_tensor, to_pil_image
 
 from utils import get_default_device
 
+import os
+import torch
+import hashlib
+
+
 # Global cache for model and processor to avoid reinitialization
 model_cache = {}
 
@@ -13,20 +18,11 @@ model_cache = {}
 def initialize_model():
     """Initialize and cache the model and processor if not already done."""
     if "model" not in model_cache:
-        model_cache["processor"] = DPTImageProcessor.from_pretrained(
-            "Intel/dpt-hybrid-midas"
-        )
-        model_cache["model"] = DPTForDepthEstimation.from_pretrained(
-            "Intel/dpt-hybrid-midas", low_cpu_mem_usage=True
-        )
+        model_cache["processor"] = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
+        model_cache["model"] = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas", low_cpu_mem_usage=True)
         model_cache["model"].eval()  # Set model to evaluation mode
         device = get_default_device()  # Utilize get_default_device from utils
         model_cache["model"].to(device)  # Move model to the default device
-
-
-import os
-import torch
-import hashlib
 
 
 def image_depth(image_tensor, cache_dir="cache"):
@@ -47,9 +43,7 @@ def image_depth(image_tensor, cache_dir="cache"):
 
     # Normalize the tensor to the range [0, 1] if it's not already
     if image_tensor.min() < 0 or image_tensor.max() > 1:
-        image_tensor = (image_tensor - image_tensor.min()) / (
-            image_tensor.max() - image_tensor.min()
-        )
+        image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
 
     device = image_tensor.device  # Use the device of the input image tensor
 
@@ -62,12 +56,8 @@ def image_depth(image_tensor, cache_dir="cache"):
         print("Loading depth tensor from cache.")
         predicted_depth = torch.load(cache_path)
     else:
-        inputs = model_cache["processor"](
-            images=image_tensor.to(device), return_tensors="pt"
-        )
-        inputs = {
-            k: v.to(device) for k, v in inputs.items()
-        }  # Ensure inputs are on the same device as image_tensor
+        inputs = model_cache["processor"](images=image_tensor.to(device), return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}  # Ensure inputs are on the same device as image_tensor
 
         with torch.no_grad():
             outputs = model_cache["model"](**inputs)

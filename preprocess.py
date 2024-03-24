@@ -17,6 +17,12 @@ import time
 import torch.nn as nn
 import kornia.contrib as KC
 
+
+import os
+import torch
+from pathlib import Path
+import kornia.feature as KF
+
 # Define a global dictionary to cache models
 model_cache = {}
 
@@ -103,12 +109,6 @@ def deblur_video_vrt(
 
     # return new  filename
     return output_folder / Path(video_path).name
-
-
-import os
-import torch
-from pathlib import Path
-import kornia.feature as KF
 
 
 def load_or_compute_features(image_tensor, vit_model, cache_file):
