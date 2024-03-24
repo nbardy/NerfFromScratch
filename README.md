@@ -22,13 +22,17 @@ Video
   - [x] Increase focus on edges within frames
   - [x] Favor frames with significant changes to minimize redundancy
 
+Expand Spacetime Handling
+
+- [x] Add Space time geometry projection to project arbitray scene geometry to 3D lookup table
+- [x] Lookup neighbors in lookup table for more scene information
+
 Models
 
 - [x] Add features from nerf follow up sin+cos
 - [x] Explore Transformers(NOTES: Data hungry and slow, is more smooth and better results with more compute)
 - [x] Add fast mobile transformer instead of MLP[In progess]
 - [x] Lookup table inspired by instantNGP
-- [x] Expand lookup table
 
 Style(TODO)
 
@@ -38,5 +42,5 @@ Style(TODO)
 Training Speedups
 
 - [x] Shoot more rays at edges in images (TODO: Add paper ref)
-- [ ] Regularize loss over empty space from InfoNERF
-- [ ] Use fast lookup tables nvidia Instant NGP(special cuda kernales)
+- [x] Regularize loss over empty space from InfoNERF(ignore KL loss from infoNERF)
+- [ ] Use fast lookup tables nvidia Instant NGP(special cuda kernels)

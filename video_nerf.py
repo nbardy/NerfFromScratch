@@ -18,14 +18,13 @@ import cv2
 
 import numpy as np
 
-import torch
 import kornia
 
 
 from models import get_model
 from utils import get_default_device
 
-from models import MultiPathGaussianMLP, SpaceTimeStepLookTable
+from preprocess import blur_scores, video_difference_scores, deblur_video
 
 
 camera_depth = 0.2
@@ -165,109 +164,126 @@ def sample_n_points_from_tensors(
     total_pixels = viewport_size[0] * viewport_size[1]
     sampled_values = []
 
+    if boost_edge:
+        # Edge detection and normalization for the first tensor as a reference
+        edge_mask = normalize_edge_detection(image_tensors[0])
+        blurred_edge_mask = kornia.filters.box_blur(
+            edge_mask.unsqueeze(0), kernel_size=(5, 5)
+        ).squeeze()  # BxHxW
+
+        # Sampling based on probability distribution
+        n_uniform = n_points // 3
+        n_edge = n_points // 3
+        n_blurred_edge = n_points - n_uniform - n_edge
+
+        # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
+        n_uniform = int(n_points * 0.1)
+        n_edge = int(n_points * 0.3)
+        n_blurred_edge = n_points - n_uniform - n_edge  # Remaining for blurred edge
+
+        # Generate probability distribution for uniform sampling
+        uniform_prob_dist = torch.ones(total_pixels) / total_pixels
+        # Sample indices for each distribution with updated ratios
+        uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)
+        edge_indices = sample_indices(edge_mask, n_edge, total_pixels)
+        blurred_edge_indices = sample_indices(
+            blurred_edge_mask, n_blurred_edge, total_pixels
+        )
+
+        # Combine and shuffle indices
+        combined_indices = torch.cat(
+            (uniform_indices, edge_indices, blurred_edge_indices)
+        )
+        combined_indices = combined_indices[torch.randperm(combined_indices.size(0))]
+    else:
+        # Uniform sampling
+        uniform_prob_dist = torch.ones(total_pixels) / total_pixels
+        combined_indices = sample_indices(uniform_prob_dist, n_points, total_pixels)
+
+    # Convert flat indices to 2D coordinates
+    y_coords = combined_indices // viewport_size[1]
+    x_coords = combined_indices % viewport_size[1]
+
     for tensor in image_tensors:
-        if boost_edge:
-            # Edge detection and normalization
-            edge_mask = normalize_edge_detection(tensor)
-            blurred_edge_mask = kornia.filters.box_blur(
-                edge_mask.unsqueeze(0), kernel_size=(5, 5)
-            ).squeeze()
-
-            # Sampling based on probability distribution
-            n_uniform = n_points // 3
-            n_edge = n_points // 3
-            n_blurred_edge = n_points - n_uniform - n_edge
-
-            # Generate probability distribution for uniform sampling
-            uniform_prob_dist = torch.ones(total_pixels) / total_pixels
-            # Sample indices for each distribution
-            uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)
-            edge_indices = sample_indices(edge_mask, n_edge, total_pixels)
-            blurred_edge_indices = sample_indices(
-                blurred_edge_mask, n_blurred_edge, total_pixels
-            )
-
-            # Combine and shuffle indices
-            combined_indices = torch.cat(
-                (uniform_indices, edge_indices, blurred_edge_indices)
-            )
-            combined_indices = combined_indices[
-                torch.randperm(combined_indices.size(0))
-            ]
-        else:
-            # Uniform sampling
-            uniform_prob_dist = torch.ones(total_pixels) / total_pixels
-            combined_indices = sample_indices(uniform_prob_dist, n_points, total_pixels)
-
-        # Convert flat indices to 2D coordinates
-        y_coords = combined_indices // viewport_size[1]
-        x_coords = combined_indices % viewport_size[1]
-
         # Sample colors from tensor using the generated indices
-        sampled_tensor_values = tensor[:, y_coords, x_coords]
+        sampled_tensor_values = tensor[:, y_coords, x_coords]  # CxN
         # Move the batch to the last dim
-        sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)
+        sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
         sampled_values.append(sampled_tensor_values)
 
     return sampled_values
 
 
-# NOTE: Input timestep is for temporal time of the video
-#       the t_vals is many values along a ray
+def compute_accumulated_transmittance(alphas):
+    # Compute accumulated transmittance along the ray
+    accumulated_transmittance = torch.cumprod(alphas, 1)
+    # Prepend ones to the start of each ray's transmittance for correct accumulation
+    return torch.cat(
+        (
+            torch.ones((accumulated_transmittance.shape[0], 1), device=alphas.device),
+            accumulated_transmittance[:, :-1],
+        ),
+        dim=-1,
+    )
+
+
 def render_rays(
-    nerf_model,
-    ray_origins,
-    ray_directions,
-    timestep,
-    near=0.02,
-    far=20.0,
-    num_samples=192,
+    nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192, T=0.1, args=None
 ):
     device = ray_origins.device
-
     # Sample points along each ray
-    t_vals = torch.linspace(near, far, num_samples, device=device).expand(
-        ray_origins.shape[0], num_samples
+    t = torch.linspace(hn, hf, nb_bins, device=device).expand(
+        ray_origins.shape[0], nb_bins
     )
     # Perturb sampling along each ray for stochastic sampling
-    mid = (t_vals[:, :-1] + t_vals[:, 1:]) / 2
-    lower = torch.cat((t_vals[:, :1], mid), -1)
-    upper = torch.cat((mid, t_vals[:, -1:]), -1)
-    u = torch.rand(t_vals.shape, device=device)
-    t_vals = lower + (upper - lower) * u  # Perturbed t values
-
+    mid = (t[:, :-1] + t[:, 1:]) / 2.0
+    lower = torch.cat((t[:, :1], mid), -1)
+    upper = torch.cat((mid, t[:, -1:]), -1)
+    u = torch.rand(t.shape, device=device)
+    t = lower + (upper - lower) * u  # Perturbed t values [batch_size, nb_bins]
     # Compute deltas for transmittance calculation
     delta = torch.cat(
         (
-            t_vals[:, 1:] - t_vals[:, :-1],
+            t[:, 1:] - t[:, :-1],
             torch.tensor([1e10], device=device).expand(ray_origins.shape[0], 1),
         ),
         -1,
     )
 
     # Compute 3D points along each ray
-    points = ray_origins[:, None, :] + ray_directions[:, None, :] * t_vals[..., None]
-
+    x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(
+        1
+    )  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
-    flat_points = points.reshape(-1, 3)
-    flat_dirs = ray_directions.unsqueeze(1).expand(-1, num_samples, -1).reshape(-1, 3)
+    ray_directions = ray_directions.expand(
+        nb_bins, ray_directions.shape[0], 3
+    ).transpose(0, 1)
 
     # Query NeRF model for colors and densities
-    colors, densities = nerf_model(flat_points, flat_dirs, timestep)
-    colors = colors.view(points.shape)
-    densities = densities.view(points.shape[:-1])
+    colors, sigma = nerf_model(x.reshape(-1, 3), ray_directions.reshape(-1, 3))
+    colors = colors.reshape(x.shape)
+    sigma = sigma.reshape(x.shape[:-1])
 
     # Compute alpha values and weights for color accumulation
-    alphas = 1 - torch.exp(-densities * delta)
-    weights = alphas * compute_transmittance(alphas)
+    alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
+    weights = compute_accumulated_transmittance(1 - alpha).unsqueeze(
+        2
+    ) * alpha.unsqueeze(2)
+
+    # Compute probability distribution for entropy regularization
+    if args.enable_entropy_loss:
+        prob = alpha / (alpha.sum(1).unsqueeze(1) + 1e-10)
+        mask = alpha.sum(1).unsqueeze(1) > T
+        regularization = -1 * prob * torch.log2(prob + 1e-10)
+        regularization = (regularization * mask).sum(1).mean()
+    else:
+        regularization = 0.0
 
     # Accumulate colors along rays
-    accumulated_colors = (weights.unsqueeze(-1) * colors).sum(dim=1)
-
-    # Add background color
-    accumulated_colors += 1 - weights.sum(dim=1, keepdim=True)
-
-    return accumulated_colors
+    c = (weights * colors).sum(dim=1)  # Pixel values
+    # Regularization for white background
+    weight_sum = weights.sum(-1).sum(-1)
+    return c + 1 - weight_sum.unsqueeze(-1), regularization
 
 
 def train_video(
@@ -278,13 +294,14 @@ def train_video(
     max_frames=None,
     blur_scores=None,
     differences=None,
+    args=None,  # Add args to access enable_entropy_loss flag
 ):
     assert max_frames is not None
     wandb.init(project="3D_nerf")
 
     camera_position = LearnableCameraPosition(n_frames=n_frames)
     # scene_function = get_model(args.model, input_dim=7)
-    scene_function = SpaceTimeStepLookTable()
+    scene_function = get_model(args.model)
 
     optimizer = torch.optim.Adam(
         list(scene_function.parameters()) + list(camera_position.parameters()),
@@ -321,7 +338,10 @@ def train_video(
 
             # Sample n random points from the camera_rays and the same number of points from the image
             sampled_colors, sampled_poses, sampled_rays = sample_n_points_from_tensors(
-                [random_frame, camera_poses, camera_rays], n_points, size
+                [random_frame, camera_poses, camera_rays],
+                n_points,
+                size,
+                boost_edge=args.boost_edge,
             )
 
             batch_camera_poses.append(sampled_poses)
@@ -345,7 +365,7 @@ def train_video(
         # Inference
         # generated_colors = scene_function(batch_input)
 
-        generated_colors = render_rays(
+        generated_colors, entropy_regularization = render_rays(
             scene_function,
             batch_camera_poses,
             batch_rays,
@@ -353,12 +373,14 @@ def train_video(
             near,
             far,
             num_samples_ray_samples,
+            args=args,  # Pass args to access enable_entropy_loss flag
         )
 
         ##
         # Loss Calculation, Backpropagation, and Gradient Reset
         optimizer.zero_grad()
-        loss_value = loss(generated_colors, batch_output)
+        loss = nn.HuberLoss()
+        loss_value = loss(generated_colors, batch_output) + entropy_regularization
         loss_value.backward()
         optimizer.step()
         scheduler.step()
@@ -510,34 +532,48 @@ if __name__ == "__main__":
         help="Maximum number of frames to use for training and inference.",
     )
     parser.add_argument(
-        "--video_path", type=str, required=True, help="Path to the input video."
-    )
-    parser.add_argument(
-        "--deblur_video", action="store_true", help="Enable video deblurring."
+        "--deblur_video",
+        action="store_true",
+        default=False,
+        help="Enable video deblurring.",
     )
     parser.add_argument(
         "--weight_blur_and_difference",
         action="store_true",
+        default=False,
         help="Enable weighted frame sampling based on blur and difference.",
+    )
+    # boost edge
+    parser.add_argument(
+        "--boost_edge",
+        action="store_true",
+        default=True,
+        help="Enable edge boosting.",
+    )
+    # Add entropy loss flag
+    parser.add_argument(
+        "--enable_entropy_loss",
+        action="store_true",
+        default=False,
+        help="Enable entropy loss regularization.",
     )
 
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
 
     # pretty print args with names
-    print("Argumnets")
+    print("Arguments")
     for arg in vars(args):
         print(f"{arg}: {getattr(args, arg)}")
 
     # preprocess
-    from preprocess import get_blur_scores, get_differences, deblur_video
 
     if args.deblur_video:
         deblurred_video = deblur_video(video_path)
 
     if args.weight_blur_and_difference:
-        blur_scores = get_blur_scores(video_path)
-        differences = get_differences(video_path)
+        blur_scores = blur_scores(video_path)
+        differences = video_difference_scores(video_path)
         # else none
     else:
         blur_scores = None
@@ -554,4 +590,5 @@ if __name__ == "__main__":
         max_frames=args.max_frames,
         blur_scores=blur_scores,
         differences=differences,
+        args=args,  # Pass args to access enable_entropy_loss flag
     )

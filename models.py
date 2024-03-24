@@ -137,18 +137,161 @@ class LearnableLookupTable(nn.Module):
             ]
 
 
+def lookup_neighbors(base_idx, neighbor_offsets, table):
+    """
+    Fetches and flattens neighbor features from a given lookup table.
+
+    Parameters:
+    - base_idx: Tensor of base indices for lookup.
+    - neighbor_offsets: List of tuples representing the offset ranges for each dimension.
+    - table: The lookup table from which features are fetched.
+
+    Returns:
+    - Flattened tensor of neighbor features.
+    """
+    neighbor_features = []
+    for offset in neighbor_offsets:
+        # Calculate neighbor index with wrap-around for each dimension
+        neighbor_idx = (
+            base_idx + torch.tensor(offset, device=base_idx.device)
+        ) % torch.tensor(table.dims, device=base_idx.device)
+        neighbor_features.append(table(neighbor_idx))
+
+    # Concatenate and flatten the neighbor features
+    neighbor_features = torch.cat(neighbor_features, dim=-1).flatten(start_dim=1)
+    return neighbor_features
+
+
+face_directions = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+corner_directions = [
+    (1, 1, 1),
+    (-1, -1, -1),
+    (1, -1, -1),
+    (-1, 1, 1),
+    (1, 1, -1),
+    (-1, -1, 1),
+    (1, -1, 1),
+    (-1, 1, -1),
+]
+temporal_directions = [
+    (0, 0, 0, 1),
+    (0, 0, 0, -1),
+]  # For time only, space remains unchanged
+time_space_directions = (
+    face_directions + corner_directions + temporal_directions
+)  # Combines all directions with time
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, p=-1.0, eps=1e-8, bias=False):
+        """
+            Root Mean Square Layer Normalization
+        :param d: model size
+        :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
+        :param eps:  epsilon value, default 1e-8
+        :param bias: whether use bias term for RMSNorm, disabled by
+            default because RMSNorm doesn't enforce re-centering invariance.
+        """
+        super(RMSNorm, self).__init__()
+
+        self.eps = eps
+        self.d = d
+        self.p = p
+        self.bias = bias
+
+        self.scale = nn.Parameter(torch.ones(d))
+        self.register_parameter("scale", self.scale)
+
+        if self.bias:
+            self.offset = nn.Parameter(torch.zeros(d))
+            self.register_parameter("offset", self.offset)
+
+    def forward(self, x):
+        if self.p < 0.0 or self.p > 1.0:
+            norm_x = x.norm(2, dim=-1, keepdim=True)
+            d_x = self.d
+        else:
+            partial_size = int(self.d * self.p)
+            partial_x, _ = torch.split(x, [partial_size, self.d - partial_size], dim=-1)
+
+            norm_x = partial_x.norm(2, dim=-1, keepdim=True)
+            d_x = partial_size
+
+        rms_x = norm_x * d_x ** (-1.0 / 2)
+        x_normed = x / (rms_x + self.eps)
+
+        if self.bias:
+            return self.scale * x_normed + self.offset
+
+        return self.scale * x_normed
+
+
+class GeometricProjectionMLP(nn.Module):
+    """
+    A small MLP for projecting 3D points into a new 3D space
+
+    This represents a small learned geometric projection model. We use this to project arbitrary points in our 3D space
+    to a cube coordinate system.
+
+    This allows us to compress arbitrary points in 3D space into a fixed size lookuptable
+    """
+
+    def __init__(self, has_t=False):
+        super(GeometricProjectionMLP, self).__init__()
+        self.origin = nn.Parameter(torch.zeros(3))  # Learnable origin
+        self.has_t = has_t
+        input_dim = 7 if has_t else 6  # x, y, z, alpha, beta, d, (optional t)
+        hidden_dim = 14
+        self.mlp = nn.Sequential(
+            RMSNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, 3),
+        )
+
+        # sigmoid for 0 - 1
+        self.sigmoid = nn.Sigmoid()
+
+        # Projects to x, y, z
+
+    # Computes radial feature does a tiny MLP to project back to a cube coordinate
+    def forward(self, x, t=None):
+        if self.has_t and t is None:
+            raise ValueError(
+                "t is required as this model was initialized with has_t=True"
+            )
+        # Compute distance from origin
+        distance = torch.sqrt(torch.sum((x - self.origin) ** 2, dim=1, keepdim=True))
+        # Compute alpha and beta angles
+        alpha = torch.atan2(x[:, 1] - self.origin[1], x[:, 0] - self.origin[0]).view(
+            -1, 1
+        )
+        beta = torch.acos((x[:, 2] - self.origin[2]) / distance).view(-1, 1)
+        # Concatenate original coordinates with spherical coordinates
+        x = torch.cat([x, alpha, beta, distance], dim=1)
+        if self.has_t:
+            t = t.view(-1, 1)  # Ensure t is correctly shaped
+            x = torch.cat([x, t], dim=1)  # Append time if applicable
+        # Project to new 3D space
+        x = self.mlp(x)
+        x = self.sigmoid(x)  # Apply sigmoid to project outputs to the range [0, 1]
+
+        return x
+
+
 # This is the authors attempt to impliment a naive lookup table version of instantNGP for videos over time
+# - Nicholas Bardy
 #
-# for fast training without the custom CUDA/triton code
+# For fast training without the custom CUDA/triton code
 #
 # We extend this to the temporal dimension for time by adding some time lookup tables, we also
 #
 # Since the high resolution temporal lookup tables can we large we keep the feature size low
-# and use a nearest neighbor lookup for the temporal dimensions to expand the feature size at
+# we use a nearest neighbor lookup for the temporal dimensions to expand the feature size at
 # inference time
-class SpaceTimeStepLookTable(nn.Module):
-    def __init__(self, output_dim=4):
-        super(SpaceTimeStepLookTable, self).__init__()
+class SpaceTimeLookTable(nn.Module):
+    def __init__(self, output_dim=4, inner_dim=64):
+        super(SpaceTimeLookTable, self).__init__()
         # Define the lookup tables for spatial features
         self.table0 = LearnableLookupTable((128, 128, 128), 64)
         self.table1 = LearnableLookupTable((64, 64, 64), 64 * 8)
@@ -162,12 +305,12 @@ class SpaceTimeStepLookTable(nn.Module):
             (128, 128, 128, 128), 4
         )  # 128x128x128x128x4
 
+        # We use one small geometric projection for all lookup tables
+        # This is used to project an arbitray scene of 3D points to a cube coordinate system for lookup
+        self.geom_proj_mlp = GeometricProjectionMLP(has_t=True)
+
         # Linear layer to downsize feature dimension and append viewing direction
         # The input dimension calculation is broken down as follows:
-        # - Spatial features from 4 tables: 512, 8*64, 8*8*32, 8*8*8*16
-        # - Temporal features from table1: 64*4 (since we concatenate before, current, after time features)
-        # - Viewing direction: 4
-        # Hence, the input size is calculated as:
         total_feature_size = (
             # table0 x sampled for 6 face neighbors and 8 corner neighbors
             64 * (6 * 8)
@@ -180,15 +323,19 @@ class SpaceTimeStepLookTable(nn.Module):
             # time_space_table1 * 3 (before, current, after)
             + 64 * 3
             # time_space_table2 x 6 face neighbors and 8 corner neighbors * 3 (before, current, after)
-            + 4 * (6 + 8) * 2
+            + 4 * (6 + 8) * 3
         )  # time_space_table2
 
         self.model_sequence = nn.Sequential(
-            nn.ReLU(), nn.Linear(total_feature_size, 128, bias=False)
+            nn.ReLU(),
+            RMSNorm(),
+            nn.Linear(total_feature_size, inner_dim, bias=False),
         )
 
         # Final projection to color and alpha
-        self.final_projection = nn.Linear(128 + 3 + 1, output_dim)  # Append dir and t
+        self.final_projection = nn.Linear(
+            inner_dim + 3 + 1, output_dim
+        )  # Append dir and t
 
     def forward(self, pos, dir, t):
         # Scale pos to the table sizes and floor to integer values for indexing
@@ -200,65 +347,38 @@ class SpaceTimeStepLookTable(nn.Module):
         # Combine pos and t for 4D indexing
         idx4 = torch.cat([idx3, t_idx.unsqueeze(-1)], dim=-1)
 
-        # Lookup features from spatial tables
-        features0 = self.table0(idx0)
-        features1 = self.table1(idx1)
-        features2 = self.table2(idx2)
-        features3 = self.table3(idx3)
+        # Define neighbor offsets for spatial and temporal lookups
+        spatial_offsets = [(-1, 0, 1)] * 3  # 3D spatial neighbors
+        temporal_offsets = [(-1, 0, 1)]  # Temporal neighbors
 
-        # Lookup temporal features
-        before_time_features = self.time_space_table1(t_idx - 1)
-        current_time_features = self.time_space_table1(t_idx)
-        after_time_features = self.time_space_table1(t_idx + 1)
-        time_features = torch.cat(
-            [before_time_features, current_time_features, after_time_features], dim=-1
-        )  # Bx(3*C)
+        # Lookup features from spatial tables using the new utility function
+        features0 = lookup_neighbors(idx0, spatial_offsets, self.table0)
+        features1 = lookup_neighbors(idx1, spatial_offsets, self.table1)
+        features2 = lookup_neighbors(idx2, spatial_offsets, self.table2)
+        features3 = lookup_neighbors(idx3, spatial_offsets, self.table3)
 
-        # Lookup neighborhood temporal features from time_space_table2
-        # Considering 6 face neighbors, 8 corner neighbors, and 2 time neighbors
-        # Total features = 6 (faces) + 8 (corners) + 2 (time) = 16 neighbors
-        # For each neighbor, considering 4D (x, y, z, t), hence 16*4 features
-        neighborhood_features = []
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dz in [-1, 0, 1]:
-                    for dt in [-1, 1]:
-                        neighbor_idx = (
-                            idx4 + torch.tensor([dx, dy, dz, dt]).to(idx4.device)
-                        ) % torch.tensor(self.time_space_table2.dims).to(idx4.device)
-                        neighborhood_features.append(
-                            self.time_space_table2(neighbor_idx)
-                        )
-        neighborhood_features = torch.cat(neighborhood_features, dim=-1)
+        # Lookup temporal features using the new utility function
+        time_features = lookup_neighbors(
+            t_idx, temporal_offsets, self.time_space_table1
+        )
 
         # Concatenate all features
         all_features = torch.cat(
-            [
-                features0,
-                features1,
-                features2,
-                features3,
-                time_features,
-                neighborhood_features,
-            ],
-            dim=-1,
+            [features0, features1, features2, features3, time_features], dim=-1
         )
 
         # Apply ReLU activation
         all_features = F.relu(all_features)
 
         # Downsize feature dimension and append viewing direction and timestep
-        downsized_features = self.downsize_features(all_features)
+        downsized_features = self.model_sequence(all_features)
         final_features = torch.cat([downsized_features, dir, t.unsqueeze(-1)], dim=-1)
 
         # Apply a biasless linear hidden layer
-        final_features = nn.Linear(128, 128, bias=False)(final_features)
-
-        # Apply normalization
-        final_features = nn.LayerNorm(128)(final_features)
+        final_features = self.final_projection(final_features)
 
         # Final projection to output
-        output = self.final_projection(final_features)
+        output = final_features
 
         return output
 
@@ -278,11 +398,9 @@ def get_model(model_name, input_dim=6):
         )
     elif model_name == "multi-res-lookup":
 
-        return SpaceTimeStepLookTable(
-            input_dim=input_dim,
+        return SpaceTimeLookTable(
             output_dim=3,
-            resolution_levels=[64, 128, 256],
-            inner_dim=512,
+            inner_dim=64,
         )
     else:
         raise ValueError(f"Model {model_name} not found")

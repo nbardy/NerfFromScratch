@@ -14,7 +14,7 @@ from torchvision.transforms.functional import to_tensor, to_pil_image
 from PIL import Image
 
 
-def wavelet_approx_blur_score(image: Image) -> float:
+def blur_scores(image: Image) -> float:
     """
     Approximates a wavelet-based motion blur score for an image using Kornia.
 
@@ -45,13 +45,6 @@ def wavelet_approx_blur_score(image: Image) -> float:
     blur_score = 1.0 - torch.mean(normalized_edge_magnitude)
 
     return blur_score.item()
-
-
-# Example usage
-image_path = "path/to/your/image.jpg"
-image = Image.open(image_path)
-blur_score = wavelet_approx_blur_score(image)
-print(f"Wavelet Approximated Motion Blur Score: {blur_score}")
 
 
 def deblur_video(
@@ -179,7 +172,7 @@ class MobileViTFeatureExtractor(nn.Module):
 feature_extractor = MobileViTFeatureExtractor()
 
 
-def video_frame_feature_differences(video_path):
+def video_difference_scores(video_path):
     cap = cv2.VideoCapture(video_path)
     ret, prev_frame = cap.read()
     prev_frame = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2RGB)
@@ -214,36 +207,3 @@ def video_frame_feature_differences(video_path):
 
     cap.release()
     return differences
-
-
-def wavelet_approx_blur_score(image: Image) -> float:
-    """
-    Approximates a wavelet-based motion blur score for an image using Kornia.
-
-    Args:
-    - image (PIL.Image): The input image.
-
-    Returns:
-    - float: A score between 0 and 1 indicating the amount of motion blur.
-    """
-    # Convert the PIL image to a tensor and add a batch dimension
-    img_tensor = to_tensor(image).unsqueeze(0)
-
-    # Convert to grayscale
-    gray_img_tensor = K.color.rgb_to_grayscale(img_tensor)
-
-    # Apply Sobel filter to detect edges
-    edges = KF.sobel(gray_img_tensor)
-
-    # Compute the magnitude of edges
-    edge_magnitude = torch.sqrt(torch.sum(edges**2, dim=1, keepdim=True))
-
-    # Normalize the edge magnitude to a range of 0 to 1
-    max_val = torch.max(edge_magnitude)
-    min_val = torch.min(edge_magnitude)
-    normalized_edge_magnitude = (edge_magnitude - min_val) / (max_val - min_val)
-
-    # Compute the blur score as the inverse of the average edge magnitude
-    blur_score = 1.0 - torch.mean(normalized_edge_magnitude)
-
-    return blur_score.item()
