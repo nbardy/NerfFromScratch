@@ -39,6 +39,8 @@ def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
     and attempts to load from cache if available. Returns a tensor of scores.
     """
+    print(video_frames)
+    print(type(video_frames))
     # Step 1: Hash video frames for cache key
     video_frames_bytes = [frame.cpu().numpy().tobytes() for frame in video_frames]  # Convert frames to bytes
     video_frames_hash = hash(tuple(video_frames_bytes))  # Hash the bytes for a unique identifier
