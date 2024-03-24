@@ -24,9 +24,14 @@ def initialize_model():
         model_cache["model"].to(device)  # Move model to the default device
 
 
-def image_depth(image_tensor):
+import os
+import torch
+import hashlib
+
+
+def image_depth(image_tensor, cache_dir="cache"):
     """
-    Estimate depth from an image tensor, with added debugging information and normalization.
+    Estimate depth from an image tensor, with added debugging information, normalization, and caching.
 
     Args:
     - image_tensor (torch.Tensor): A tensor representation of the image of shape (3, H, W).
@@ -41,6 +46,7 @@ def image_depth(image_tensor):
         raise TypeError("Input must be a torch.Tensor")
 
     # Debugging: Print min and max of the incoming tensor
+    print("[debug] Depth tensor")
     print(
         f"Incoming tensor min: {image_tensor.min().item()}, max: {image_tensor.max().item()}"
     )
@@ -53,18 +59,42 @@ def image_depth(image_tensor):
         print("Tensor normalized to [0, 1] range.")
 
     device = image_tensor.device  # Use the device of the input image tensor
-    inputs = model_cache["processor"](
-        images=image_tensor.to(device), return_tensors="pt"
-    )
-    inputs = {
-        k: v.to(device) for k, v in inputs.items()
-    }  # Ensure inputs are on the same device as image_tensor
 
-    with torch.no_grad():
-        outputs = model_cache["model"](**inputs)
-        predicted_depth = outputs.predicted_depth  # Shape: (1, H, W)
+    # Generate a unique hash for the input tensor to use as a cache key
+    tensor_hash = hashlib.sha256(image_tensor.cpu().numpy().tobytes()).hexdigest()
+    cache_path = os.path.join(cache_dir, f"{tensor_hash}.pt")
+
+    # Check if the result is already cached
+    if os.path.exists(cache_path):
+        print("Loading depth tensor from cache.")
+        predicted_depth = torch.load(cache_path)
+    else:
+        inputs = model_cache["processor"](
+            images=image_tensor.to(device), return_tensors="pt"
+        )
+        inputs = {
+            k: v.to(device) for k, v in inputs.items()
+        }  # Ensure inputs are on the same device as image_tensor
+
+        with torch.no_grad():
+            outputs = model_cache["model"](**inputs)
+            predicted_depth = outputs.predicted_depth  # Shape: (1, H, W)
+
+        # Cache the result
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.save(predicted_depth, cache_path)
+        print("Saved depth tensor to cache.")
 
     return predicted_depth
+
+
+# Let's make a new normalize that expect a tensor to be on gpu and normalized and we pass it right to the model
+def depth_pt_prop_deriv(image_tensor):
+    model = initialize_model()
+    # model train
+    model.train()
+
+    return model.forward(image_tensor)
 
 
 # Example usage

@@ -305,7 +305,7 @@ def render_rays(
     return c + 1 - weight_sum.unsqueeze(-1), regularization, depth
 
 
-def compute_style_loss(batch_output, depth_maps, args):
+def compute_style_loss(batch_output, depth, args):
     """
     Computes the style loss using CLIP by comparing generated images and depth maps against text prompts.
 
@@ -317,7 +317,10 @@ def compute_style_loss(batch_output, depth_maps, args):
     device = get_default_device()
     # Utilize provided utility functions for embedding extraction
     image_embeds = embed_image(batch_output.to(device))  # [Batch, Seq_len, Emb_dim]
-    depth_map_embeds = embed_text(depth_maps.to(device))  # [Batch, Seq_len, Emb_dim]
+    # calculate the depth map of the batch_output
+    from depth import depth_pt_prop_deriv
+
+    depth_map_clip_embed = embed_image(depth.to(device))
 
     loss_dict = {}
     total_loss = 0.0
@@ -325,11 +328,11 @@ def compute_style_loss(batch_output, depth_maps, args):
     # Process geometry style text prompts
     if args.geo_style_text:
         geo_text_embeds = embed_text(
-            ["A depth map.", f"A depth map, {args.style_prompt}"], device=device
+            f"A depth map, {args.style_prompt}", device=device
         )  # [Batch, Seq_len, Emb_dim]
-        geo_loss = F.cross_entropy(geo_text_embeds, depth_map_embeds)
+        geo_loss = F.cross_entropy(geo_text_embeds, depth_map_clip_embed)
         total_loss += args.scale_geo * geo_loss
-        loss_dict["geo_loss"] = geo_loss.item()
+        loss_dict["geo_style_loss"] = geo_loss.item()
 
     # Process clip style text prompts
     if args.clip_style_text:
@@ -378,6 +381,7 @@ def exponential_cluster_indices(
     :return: A tensor of cluster indices.
     """
     n_clusters = n_frames // cluster_length
+    device = get_default_device()
     cluster_centers = torch.randint(0, video_length, (n_clusters,)).to(
         device
     )  # GPU operation
@@ -404,38 +408,50 @@ def exponential_cluster_indices(
     return cluster_indices
 
 
-def sample_uniform(video_frames, n_frames, cluster_run_count=1, cluster_exponential=2):
+def sample_uniform_with_runs(
+    video_frames, n_frames, cluster_run_count=1, cluster_exponential=2
+):
     """
     Uniformly samples frames from the video, with optional clustered sampling.
 
-    :param video_frames: List of video frames.
+    :param video_frames: Tensor of video frames in the shape of [num_frames, C, H, W].
     :param n_frames: Total number of frames to sample.
     :param cluster_run_count: Number of runs for the cluster sampling.
     :param cluster_exponential: Exponential factor for offset increase.
-    :return: A list of sampled frames.
+    :return: A tensor of sampled frames in the shape of [n_frames, C, H, W].
     """
+    assert (
+        video_frames.dim() == 4
+    ), "video_frames must be a 4D tensor [num_frames, C, H, W]"
+    assert (
+        isinstance(n_frames, int) and n_frames > 0
+    ), "n_frames must be a positive integer"
+    assert (
+        isinstance(cluster_run_count, int) and cluster_run_count > 0
+    ), "cluster_run_count must be a positive integer"
+    assert isinstance(cluster_exponential, int) or isinstance(
+        cluster_exponential, float
+    ), "cluster_exponential must be a number"
+
+    video_length = video_frames.shape[0]
     if cluster_run_count > 1:
-        # Clustered sampling with exponential offset pattern
         cluster_length = n_frames // cluster_run_count
         cluster_indices = exponential_cluster_indices(
-            len(video_frames), n_frames, cluster_length, cluster_exponential
+            video_length, n_frames, cluster_length, cluster_exponential
         )
     else:
-        # Uniform random sampling
-        cluster_indices = torch.randperm(len(video_frames))[:n_frames]
+        cluster_indices = torch.randperm(video_length)[:n_frames]
 
-    # Select frames based on indices
-    sampled_frames = [video_frames[i] for i in cluster_indices.tolist()]
+    sampled_frames = video_frames[cluster_indices]
 
     return sampled_frames
 
 
-def sample_with_scores(
+def sample_with_scores_and_runs(
     video_frames,
     differences,
     blur_scores,
     n_frames,
-    sample_clusters,
     cluster_run_count=9,
     cluster_exponential=2,
 ):
@@ -446,7 +462,6 @@ def sample_with_scores(
     :param differences: List of difference scores between consecutive frames.
     :param blur_scores: List of blur scores for each frame.
     :param n_frames: Total number of frames to sample.
-    :param sample_clusters: Number of frames to sample in each cluster.
     :param cluster_run_count: Number of runs for the cluster sampling.
     :param cluster_exponential: Exponential factor for offset increase.
     :return: A list of sampled frames.
@@ -491,7 +506,7 @@ def sample_with_scores(
 
 
 def sample_by_args(
-    video_frames, n_frames, blur_scores=None, differences=None, args=None
+    video_frames, n_frames=None, blur_scores=None, differences=None, args=None
 ):
     """
     Dispatcher function to select the appropriate sampling method based on provided arguments.
@@ -501,8 +516,10 @@ def sample_by_args(
     :param args: Command line arguments or any other configuration.
     :return: A list of sampled frames.
     """
-    if args.weight_blur_and_difference is None or args.weight_blur_and_difference == 0:
-        return sample_uniform(
+    assert args is not None, "Command line arguments or configuration must be provided."
+
+    if not args.weight_blur_and_difference:
+        return sample_uniform_with_runs(
             video_frames,
             n_frames,
             cluster_run_count=args.time_sample_clusters,
@@ -515,7 +532,7 @@ def sample_by_args(
             differences is not None
         ), "Differences are required for weighted sampling."
 
-        return sample_with_scores(
+        return sample_with_scores_and_runs(
             video_frames,
             differences,
             blur_scores,
@@ -562,7 +579,11 @@ def train_video(
 
     for epoch in range(epochs):
         sampled_frames = sample_by_args(
-            video_frames, differences, blur_scores, n_frames, args
+            video_frames,
+            n_frames=n_frames,
+            differences=differences,
+            blur_scores=blur_scores,
+            args=args,
         )
         batch_camera_poses = []
         batch_rays = []
@@ -735,7 +756,10 @@ def train_style_video(
         optimizer.step()
         scheduler.step()
 
+        # log generated colors and depth
         log_data = {
+            "generated_colors": wandb.Image(generated_colors),
+            "depth": wandb.Image(depth),
             "style loss": style_loss.item(),
             "learning rate": scheduler.get_last_lr()[0],
         }
@@ -836,13 +860,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_points",
         type=int,
-        default=8000,
+        default=1000,
         help="Number of points to sample for training",
     )
     parser.add_argument(
         "--n_frames",
         type=int,
-        default=10,
+        default=27,
         help="Number of frames to sample from the video",
     )
     parser.add_argument("--validation_steps", type=int, default=40)
@@ -853,7 +877,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_frames",
         type=int,
-        default=5,
+        default=5000,
         help="Maximum number of frames to use for training and inference.",
     )
     parser.add_argument(
