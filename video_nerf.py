@@ -547,14 +547,11 @@ def sample_by_args(
     :return: A list of sampled frames.
     """
     assert args is not None, "Command line arguments or configuration must be provided."
+    assert isinstance(video_frames, list), "video_frames must be a list of video frames"
 
-    # riase error type of video frames is wrong
-    # if not isinstance(video_frames, list):
-    #     raise Start here
-    #     raise TypeError("video_frames must be a list of video frames")
-
+    sampled_frames = []
     if not args.weight_blur_and_difference:
-        return sample_uniform_with_runs(
+        sampled_frames = sample_uniform_with_runs(
             video_frames,
             n_frames,
             cluster_run_count=args.time_sample_clusters,
@@ -567,13 +564,22 @@ def sample_by_args(
             differences is not None
         ), "Differences are required for weighted sampling."
 
-        return sample_with_scores_and_runs(
+        sampled_frames = sample_with_scores_and_runs(
             video_frames,
             differences,
             blur_scores,
             n_frames,
             cluster_run_count=args.time_sample_clusters,
         )
+
+    if args.sample_long_temporal:
+        long_temporal_indices = sample_exponential_clusters(
+            len(video_frames), 11, 8, 5, 10
+        )
+        long_temporal_frames = [video_frames[i] for i in long_temporal_indices.tolist()]
+        sampled_frames += long_temporal_frames
+
+    return sampled_frames
 
 
 def train_video(
@@ -1014,6 +1020,12 @@ if __name__ == "__main__":
         type=float,
         default=0.001,
         help="Weight decay for the optimizer.",
+    )
+    parser.add_argument(
+        "--sample_long_temporal",
+        action="store_true",
+        default=False,
+        help="Enable sampling of long temporal frames.",
     )
 
     args = parser.parse_args()
