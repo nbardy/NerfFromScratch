@@ -928,7 +928,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight_blur_and_difference",
         action="store_true",
-        default=False,
+        default=True,
         help="Enable weighted frame sampling based on blur and difference.",
     )
     parser.add_argument(

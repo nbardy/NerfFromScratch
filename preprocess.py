@@ -21,11 +21,13 @@ import kornia.contrib as KC
 model_cache = {}
 
 
-def blur_scores(image: Image) -> float:
+def blur_scores(image_path: str) -> float:
     """
     Approximates a wavelet-based motion blur score for an image using Kornia.
+    This function now accepts an image path instead of an Image object.
     """
-    img_tensor = to_tensor(image).unsqueeze(0)  # 1xCxHxW
+    image = Image.open(image_path)  # Open image from path
+    img_tensor = ToTensor()(image).unsqueeze(0)  # 1xCxHxW
     gray_img_tensor = K.color.rgb_to_grayscale(img_tensor)  # 1x1xHxW
     edges = K.feature.sobel(gray_img_tensor)  # 1x1xHxW
     edge_magnitude = torch.sqrt(torch.sum(edges**2, dim=1, keepdim=True))  # 1x1xHxW
