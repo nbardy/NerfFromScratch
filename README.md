@@ -18,11 +18,11 @@ Currently the code is not running as a did a major overhaul to add all the featu
 
 #### Models
 
-- [x] Add spacetime lookup tables
 - [x] Explore Transformers instead of MLPs(NOTES: Data hungry and slow, is more smooth and better results with more compute)
 - [x] Add fast mobile transformer instead of MLP[In progess, code is in repo haven't tested on NERFs)(Probably ditch this in favor of lookup tables)
 - [x] Lookup table inspired by instantNGP
-
+- [x] Add spacetime lookup tables
+      
 #### Expand Spacetime Handling
 
 - [x] Add Space time geometry projection to project arbitrary scene geometry to cube based 3D lookup tables
