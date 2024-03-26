@@ -362,9 +362,10 @@ class SpaceTimeLookTable(nn.Module):
         self.table1 = LearnableLookupTable((64, 64, 64), 64 * 8)
         self.table2 = LearnableLookupTable((32, 32, 32), 64 * 8 * 8)
         self.table3 = LearnableLookupTable((16, 16, 16), 64 * 8 * 8 * 8)
-        # Define the lookup tables for temporal features
+
+        # Define the lookup tables for spacetime features
         self.space_time_table_1 = LearnableLookupTable((16, 16, 16, 64), 64)  # 16x16x16x64x64
-        self.space_time_table_2 = LearnableLookupTable((128, 128, 128, 128), 8)  # 128x128x128x128x4
+        self.space_time_table_2 = LearnableLookupTable((128, 128, 64, 16), 8)  # 128x128x64x16x8
 
         # This table is low resolution soace and mostly carries high resolution
         # time data
@@ -560,10 +561,11 @@ class MoeSpaceTimeModel(nn.Module):
 
         # Expert counts for tables
         num_table_experts = 6
-        table_feature_size = 64
+        table_size = (64, 64, 64, 128)
+        table_feature_size = 16
 
         self.table_moe = MoeLayer(
-            experts=nn.ModuleList([LearnableLookupTable((128, 128, 128, table_feature_size), table_feature_size) for _ in range(num_table_experts)]),
+            experts=nn.ModuleList([LearnableLookupTable(table_size, table_feature_size) for _ in range(num_table_experts)]),
             gate=SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts),
             moe_args=MoeArgs(
                 num_experts=num_table_experts,
