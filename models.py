@@ -11,6 +11,16 @@ from utils import get_default_device
 from torch.nn import functional as F
 
 
+import dataclasses
+from typing import List
+
+import torch
+import torch.nn.functional as F
+from simple_parsing.helpers import Serializable
+from torch import nn
+
+
+#  A simple MLP network
 class MLP(nn.Module):
     def __init__(self, input_dim=5, inner_dim=512, output_dim=3, depth=5):
         super(MLP, self).__init__()
@@ -35,6 +45,7 @@ class MLP(nn.Module):
         return self.final_layer(x)
 
 
+# A mlp with lower frequency bias
 class GaussianFeatureMLP(nn.Module):
     def __init__(self, input_dim=2, output_dim=3, num_features=256, sigma=10.0):
         super(GaussianFeatureMLP, self).__init__()
@@ -228,8 +239,9 @@ class GeometricProjectionMLP(nn.Module):
 
         # Feature MLP for original coordinates with non-linearity
         self.feature_mlp = nn.Sequential(
-            SwiGLU(),
             nn.Linear(feature_input_dim, hidden_dim, bias=False),
+            SwiGLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, 3),
         )
@@ -386,8 +398,9 @@ class SpaceTimeLookTable(nn.Module):
         # Do one layer of linear+non-linear on features
         self.value_mlp = nn.Sequential(
             RMSNorm(total_feature_size),
-            SwiGLU(),
             nn.Linear(total_feature_size, inner_dim, bias=False),
+            SwiGLU(),
+            nn.Linear(inner_dim, inner_dim),
         )
 
         # Final projection to color and alpha
@@ -431,8 +444,6 @@ class SpaceTimeLookTable(nn.Module):
 
         time_focus_features = lookup_neighbors(idx_time_focus, self.exponential_time_offsets, self.time_focus_spacetime_table3)
 
-        v
-
         # Concatenate all features
         all_features = torch.cat(
             [
@@ -447,20 +458,199 @@ class SpaceTimeLookTable(nn.Module):
             dim=-1,
         )
 
-        # Apply ReLU activation
-        all_features = F.relu(all_features)
-
         # Downsize feature dimension and append viewing direction and timestep
         downsized_features = self.value_mlp(all_features)
         final_features = torch.cat([downsized_features, dir, t.unsqueeze(-1)], dim=-1)
 
         # Apply a biasless linear hidden layer
-        final_features = self.final_projection(final_features)
-
-        # Final projection to output
-        output = torch.sigmoid(final_features)  # Bx(output_dim)
+        output = self.final_projection(final_features)
 
         return output
+
+
+###
+# Mixture of Expert SpaceTimeLookupTable
+###
+
+
+# This impliments an MoE strategy for efficient scene learning
+
+
+# A simple multi math MLP standard in NERFs for rendering D in one stream and color from a second viewpoint stream,
+# Allows two inputs and outputs at different points in the network
+class MultiPathFeatureMLP(nn.Module):
+    def __init__(
+        self,
+        feature_input_dim=512,
+        second_input_dim=3,
+        hidden_dim=64,
+        output_dim_1=1,
+        out_dim_2=3,
+    ):
+        super(MultiPathFeatureMLP, self).__init__()
+
+        self.feature_input_dim = feature_input_dim
+        self.second_input_dim = second_input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim_1 = output_dim_1
+        self.out_dim_2 = out_dim_2
+
+        # Random projection matrix to project from feature_dim to hidden_dim
+        self.feature_projection = nn.Sequential(
+            nn.Linear(feature_input_dim, hidden_dim, bias=False),
+            SwiGLU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=True),
+            RMSNorm(),
+        )
+
+        self.output_1_projection = nn.Linear(hidden_dim, output_dim_1)
+        self.output_2_projection = nn.Linear(hidden_dim + output_dim_1, out_dim_2)
+
+    def forward(self, x, y):
+        x = self.feature_projection(x)
+        out_1 = self.output_1_projection(x)
+
+        x = torch.cat([x, out_1], dim=-1)
+        out_2 = self.output_2_projection(x)
+
+        return torch.cat([out_1, out_2], dim=-1)
+
+
+# An MLP design to handle sample values 4D and make a cheap gating function
+class SegGLUMLP(nn.Module):
+    def __init__(self, input_dim, inner_dim, output_dim):
+        super(SegGLUMLP, self).__init__()
+        self.projection = nn.Linear(input_dim, inner_dim // 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(inner_dim, inner_dim),
+            RMSNorm(inner_dim),
+            nn.Linear(inner_dim, output_dim),
+        )
+
+    def forward(self, x):
+        x_proj = self.projection(x)
+        sin_x = torch.sin(x_proj)
+        cos_x = torch.cos(x_proj)
+        x = torch.cat((sin_x, F.silu(sin_x), cos_x, F.silu(cos_x)), dim=-1)
+        x = self.mlp(x)
+
+        return x
+
+
+@dataclasses.dataclass
+class MoeArgs(Serializable):
+    num_experts: int
+    num_experts_per_tok: int
+    num_default_experts: int = 0  # Number of default experts that are always selected
+
+
+# MoE layer to gate an arbitary set of models
+class MoeLayer(nn.Module):
+    def __init__(self, experts: List[nn.Module], gate: nn.Module, moe_args: MoeArgs):
+        super().__init__()
+        assert len(experts) > 0
+        self.experts = nn.ModuleList(experts)
+        self.gate = gate
+        self.args = moe_args
+
+    def forward(self, gate_inputs: torch.Tensor, inputs: torch.Tensor):
+        gate_logits = self.gate(gate_inputs)
+        weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
+        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        results = torch.zeros_like(inputs)
+
+        # Process default experts
+        if self.args.num_default_experts > 0:
+            default_experts = self.experts[: self.args.num_default_experts]
+            for default_expert in default_experts:
+                results += default_expert(inputs)
+
+        # Process selected experts
+        for i, expert in enumerate(self.experts[self.args.num_default_experts :], start=self.args.num_default_experts):
+            batch_idx, nth_expert = torch.where(selected_experts == i - self.args.num_default_experts)
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx])
+        return results
+
+
+##
+#  An MoE SpaceTime lookup table model for scene representation
+#
+class MoeSpaceTimeModel(nn.Module):
+    def __init__(self):
+        super(MoeSpaceTimeModel, self).__init__()
+
+        self.input_dim = 4
+
+        # Expert counts for tables
+        num_table_experts = 200
+        table_feature_size = 512
+
+        self.table_moe = MoeLayer(
+            experts=nn.ModuleList([LearnableLookupTable((128, 128, 128, 512), table_feature_size) for _ in range(num_table_experts)]),
+            gate=SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts),
+            moe_args=MoeArgs(
+                num_experts=num_table_experts,
+                num_experts_per_tok=22,
+                num_default_experts=2,
+            ),
+        )
+
+        num_geo_experts = 8
+        self.geometric_layer = MoeLayer(
+            experts=nn.ModuleList([GeometricProjectionMLP(has_t=True) for _ in range(num_geo_experts)]),
+            gate=SegGLUMLP(4, 16, output_dim=num_geo_experts),
+            moe_args=MoeArgs(
+                num_experts=num_geo_experts,
+                num_experts_per_tok=1,
+                num_default_experts=1,
+            ),
+        )
+
+        num_active_tables = 22 + 2
+        scene_feature_size = num_active_tables * table_feature_size
+
+        num_render_experts = 8
+        render_feature_size = 8
+        self.render_layer = MoeLayer(
+            experts=nn.ModuleList([SegGLUMLP(scene_feature_size, 64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
+            gate=SegGLUMLP(4, 16, output_dim=num_render_experts),
+            moe_args=MoeArgs(
+                num_experts=num_render_experts,
+                num_experts_per_tok=2,
+                num_default_experts=1,
+            ),
+        )
+
+        render_feature_size = render_feature_size * num_render_experts
+
+        # The original NERF paper shows benefits of having a separate color prediction based on
+        # the viewing direction, we do this here as well
+        self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
+        self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
+
+    def forward(self, pos, dir, t):
+        # Sum the two geometric projections from the two geometric layers
+        geo_features_1 = self.geometric_layer(pos, pos)
+        geo_features_2 = self.geometric_layer(pos, pos)
+        geo_features_sum = geo_features_1 + geo_features_2
+
+        # Forward pass through the table_moe with summed geometric features
+        table_features = self.table_moe(geo_features_sum, geo_features_sum).view(
+            -1, self.table_moe.args.num_experts_per_tok * 512
+        )  # Bx(num_experts_per_tok*512)
+
+        # Call the render layer experts
+        render_features = self.render_layer(table_features, table_features)  # Bx(num_render_experts*4)
+
+        # Get opacity from alpha feature layer
+        opacity = self.alpha_feature_layer(render_features)  # Bx1
+
+        # Concat viewing input direction along with render features and depth, and project color
+        color_input = torch.cat([render_features, dir, opacity], dim=-1)  # Bx(render_feature_size+3+1)
+        color = self.color_feature_layer(color_input)  # Bx3
+
+        # Return a 4 dim of color + opacity
+        return torch.cat([color, opacity], dim=-1)  # Bx4
 
 
 def get_model(model_name, input_dim=6):
