@@ -646,3 +646,14 @@ def get_model(model_name, input_dim=6):
         return MoeSpaceTimeModel()
     else:
         raise ValueError(f"Model {model_name} not found")
+
+
+# If main test models
+# We can then pass that batch of 3D points through the model and see if we get back 4D points
+if __name__ == "__main__":
+    model = get_model("moe-spacetime")
+    pos = torch.randn(100, 3)
+    dir = torch.randn(100, 3)
+    t = torch.randn(100, 1)
+    y = model(pos, dir, t)
+    print(y.shape)
