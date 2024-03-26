@@ -1,7 +1,4 @@
-import os
-
-# Loads vdieo as pytorh  frames
-import torch
+import pickle
 import torchvision
 import subprocess
 import shutil
@@ -13,15 +10,10 @@ import requests
 import time
 
 import os
-from pathlib import Path
 from urllib.request import urlopen
 import torch
 import timm
 
-
-import os
-import torch
-from pathlib import Path
 
 # Define a global dictionary to cache models
 model_cache = {}
@@ -166,7 +158,8 @@ def process_video_frames(video_frames):
 
     if cache_file.exists():
         print(f"Loading processed data from {cache_file}")
-        data = torch.load(cache_file)
+        with open(cache_file, "rb") as f:
+            all_features = pickle.load(f)
     else:
         all_features = []
         model = load_timm_model("efficientvit_m5.r224_in1k", pretrained=True)
@@ -177,21 +170,19 @@ def process_video_frames(video_frames):
             transforms = timm.data.create_transform(**data_config, is_training=False)
             output = model(transforms(img).unsqueeze(0))
             top5_probabilities, top5_class_indices = torch.topk(output.softmax(dim=1) * 100, k=5)
-            data["classification"].append((top5_probabilities, top5_class_indices))
 
-            # Feature Map Extraction
-            model = load_timm_model("efficientvit_m5.r224_in1k", pretrained=True, features_only=True)
             output = model(transforms(img).unsqueeze(0))
-            data["feature_maps"].append([o.shape for o in output])
 
             # Save processed data to cache
-            torch.save(data, cache_file)
             print(f"Processed data saved to {cache_file}")
 
             all_features.append(output)
+
+        with open(cache_file, "wb") as f:
+            pickle.dump(all_features, f)
         unload_model(model)
 
-    return all_features
+        return all_features
 
 
 def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
@@ -286,7 +277,7 @@ def main():
 
     print(f"Processing video: {video_path}")
 
-    video_frames, video_fps = load_video(video_path, max_frames=args.max_frames)
+    video_frames, video_fps = load_video(video_path)
     differences_start_time = time.time()
     differences = get_image_feature_difference_scores(video_frames)
     differences_end_time = time.time()
@@ -299,9 +290,11 @@ def main():
     deblur_start_time = time.time()
     # Deblur the video using VRT model
     deblurred_video_path = deblur_video_vrt(video_path, deblur_type="VRT")
-    deblurred_video_frames, _, _ = load_video(deblurred_video_path, max_frames=args.max_frames)
+    deblurred_video_frames, _, _ = load_video(deblurred_video_path)
     deblur_end_time = time.time()
     print(f"Deblurring took {deblur_end_time - deblur_start_time:.2f} seconds.")
+    print(f"Shape of deblurred video frames: {deblurred_video_frames.shape}")
+    print("Saved deblurred video to: ", deblurred_video_path)
 
     print(f"Processing completed in {end_time - start_time:.2f} seconds.")
 
