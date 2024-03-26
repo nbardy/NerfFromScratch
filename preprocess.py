@@ -157,13 +157,12 @@ def load_timm_model(model_name="efficientvit_m5.r224_in1k", pretrained=True, fea
     return model_cache[key]
 
 
-def process_video_frames(video_frames, cache_dir="cache"):
+def process_video_frames(video_frames):
     """
     Process video frames using EfficientViT model for features
     """
     # Ensure cache directory exists
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    cache_file = Path(cache_dir) / f"{Path(video_path).stem}_processed.pt"
+    cache_file = generate_hash_and_cache_path(video_frames)
 
     if cache_file.exists():
         print(f"Loading processed data from {cache_file}")
