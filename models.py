@@ -1,23 +1,15 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 from utils import get_default_device
-
-from torch.nn import functional as F
 
 
 import dataclasses
 from typing import List
 
-import torch
-import torch.nn.functional as F
 from simple_parsing.helpers import Serializable
-from torch import nn
 
 
 #  A simple MLP network
