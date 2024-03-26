@@ -468,58 +468,33 @@ class SpaceTimeLookTable(nn.Module):
         return output
 
 
+####
 ###
-# Mixture of Expert SpaceTimeLookupTable
+# Mixture of Expert Models
 ###
+#
+# The following code is for implimenting various classes for the MoE
+# approach
+#
+# We use a specialized MLP for projection, gating, and render layers.
+# The bulk of the paremeters are stored in a large number of expert lookup
+# tables.
+#
+# We put a expert layer of top of our three core steps.
+# 1. Project
+# 2. Lookup
+# 3. Render
 
 
-# This impliments an MoE strategy for efficient scene learning
-
-
-# A simple multi math MLP standard in NERFs for rendering D in one stream and color from a second viewpoint stream,
-# Allows two inputs and outputs at different points in the network
-class MultiPathFeatureMLP(nn.Module):
-    def __init__(
-        self,
-        feature_input_dim=512,
-        second_input_dim=3,
-        hidden_dim=64,
-        output_dim_1=1,
-        out_dim_2=3,
-    ):
-        super(MultiPathFeatureMLP, self).__init__()
-
-        self.feature_input_dim = feature_input_dim
-        self.second_input_dim = second_input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim_1 = output_dim_1
-        self.out_dim_2 = out_dim_2
-
-        # Random projection matrix to project from feature_dim to hidden_dim
-        self.feature_projection = nn.Sequential(
-            nn.Linear(feature_input_dim, hidden_dim, bias=False),
-            SwiGLU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            RMSNorm(),
-        )
-
-        self.output_1_projection = nn.Linear(hidden_dim, output_dim_1)
-        self.output_2_projection = nn.Linear(hidden_dim + output_dim_1, out_dim_2)
-
-    def forward(self, x, y):
-        x = self.feature_projection(x)
-        out_1 = self.output_1_projection(x)
-
-        x = torch.cat([x, out_1], dim=-1)
-        out_2 = self.output_2_projection(x)
-
-        return torch.cat([out_1, out_2], dim=-1)
-
-
-# An MLP design to handle sample values 4D and make a cheap gating function
+# AN MLP that uses modern activation and normalization functions from
+# modern transformers researc
+##
+# We use this for gating and render layers
 class SegGLUMLP(nn.Module):
     def __init__(self, input_dim, inner_dim, output_dim):
         super(SegGLUMLP, self).__init__()
+        assert inner_dim % 4 == 0
+
         self.projection = nn.Linear(input_dim, inner_dim // 4)
         self.mlp = nn.Sequential(
             nn.Linear(inner_dim, inner_dim),
@@ -531,7 +506,7 @@ class SegGLUMLP(nn.Module):
         x_proj = self.projection(x)
         sin_x = torch.sin(x_proj)
         cos_x = torch.cos(x_proj)
-        x = torch.cat((sin_x, F.silu(sin_x), cos_x, F.silu(cos_x)), dim=-1)
+        x = torch.cat((sin_x, F.silu(sin_x), cos_x, F.silu(cos_x)), dim=-1)  # * 4 the size
         x = self.mlp(x)
 
         return x
@@ -575,6 +550,8 @@ class MoeLayer(nn.Module):
 ##
 #  An MoE SpaceTime lookup table model for scene representation
 #
+#  This wrap our other model layers with MoE
+#
 class MoeSpaceTimeModel(nn.Module):
     def __init__(self):
         super(MoeSpaceTimeModel, self).__init__()
@@ -612,7 +589,7 @@ class MoeSpaceTimeModel(nn.Module):
         num_render_experts = 8
         render_feature_size = 8
         self.render_layer = MoeLayer(
-            experts=nn.ModuleList([SegGLUMLP(scene_feature_size, 64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
+            experts=nn.ModuleList([SegGLUMLP(scene_feature_size, inner_dim=64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
             gate=SegGLUMLP(4, 16, output_dim=num_render_experts),
             moe_args=MoeArgs(
                 num_experts=num_render_experts,
@@ -629,28 +606,25 @@ class MoeSpaceTimeModel(nn.Module):
         self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
 
     def forward(self, pos, dir, t):
-        # Sum the two geometric projections from the two geometric layers
-        geo_features_1 = self.geometric_layer(pos, pos)
-        geo_features_2 = self.geometric_layer(pos, pos)
-        geo_features_sum = geo_features_1 + geo_features_2
+        """
+        Processes input position, direction, and time through geometric, table, and render layers to produce color and opacity.
+        Concatenates position and time, sums geometric layer outputs, passes through table MoE and render layer, and finally predicts color and opacity.
+        """
+        x = torch.cat([pos, t.unsqueeze(-1)], dim=-1)  # Concatenate position and time
+        all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
+        geo_features_sum = torch.sum(all_geometric, dim=-1)  # Sum geometric features
 
-        # Forward pass through the table_moe with summed geometric features
-        table_features = self.table_moe(geo_features_sum, geo_features_sum).view(
-            -1, self.table_moe.args.num_experts_per_tok * 512
-        )  # Bx(num_experts_per_tok*512)
+        all_table_values = self.table_moe(gate_inputs=geo_features_sum, inputs=geo_features_sum)  # Process summed geometric features through table MoE
+        table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
 
-        # Call the render layer experts
-        render_features = self.render_layer(table_features, table_features)  # Bx(num_render_experts*4)
+        render_features = self.render_layer(gate_inputs=geo_features_sum, inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
 
-        # Get opacity from alpha feature layer
-        opacity = self.alpha_feature_layer(render_features)  # Bx1
+        opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
 
-        # Concat viewing input direction along with render features and depth, and project color
-        color_input = torch.cat([render_features, dir, opacity], dim=-1)  # Bx(render_feature_size+3+1)
-        color = self.color_feature_layer(color_input)  # Bx3
+        color_input = torch.cat([render_features, dir, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
+        color = self.color_feature_layer(color_input)  # Predict color, Bx3
 
-        # Return a 4 dim of color + opacity
-        return torch.cat([color, opacity], dim=-1)  # Bx4
+        return torch.cat([color, opacity], dim=-1)  # Return color and opacity, Bx4
 
 
 def get_model(model_name, input_dim=6):
