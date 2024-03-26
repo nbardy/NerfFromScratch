@@ -22,9 +22,7 @@ class MLP(nn.Module):
         )
 
         def block():
-            return nn.Sequential(
-                nn.Linear(inner_dim, inner_dim), nn.ReLU(), nn.LayerNorm(inner_dim)
-            )
+            return nn.Sequential(nn.Linear(inner_dim, inner_dim), nn.ReLU(), nn.LayerNorm(inner_dim))
 
         self.intermediate_layers = nn.ModuleList([block() for _ in range(depth - 1)])
 
@@ -40,12 +38,8 @@ class MLP(nn.Module):
 class GaussianFeatureMLP(nn.Module):
     def __init__(self, input_dim=2, output_dim=3, num_features=256, sigma=10.0):
         super(GaussianFeatureMLP, self).__init__()
-        self.B = nn.Parameter(
-            torch.randn(input_dim, num_features) * sigma, requires_grad=False
-        )
-        self.mlp = MLP(
-            input_dim=num_features * 2, inner_dim=512, output_dim=output_dim, depth=5
-        )
+        self.B = nn.Parameter(torch.randn(input_dim, num_features) * sigma, requires_grad=False)
+        self.mlp = MLP(input_dim=num_features * 2, inner_dim=512, output_dim=output_dim, depth=5)
 
         # Print param count
         print(
@@ -80,9 +74,7 @@ class MultiPathGaussianMLP(nn.Module):
     ):
         super(MultiPathGaussianMLP, self).__init__()
         # Gaussian encoding for 3D position
-        self.B_pos = nn.Parameter(
-            torch.randn(pos_input_dim, num_features) * sigma, requires_grad=False
-        )
+        self.B_pos = nn.Parameter(torch.randn(pos_input_dim, num_features) * sigma, requires_grad=False)
         # MLP for processing encoded position and time
         size = num_features * 2 + 1
 
@@ -133,9 +125,7 @@ class LearnableLookupTable(nn.Module):
         if len(self.dims) == 3:
             return self.table[indices[:, 0], indices[:, 1], indices[:, 2]]
         elif len(self.dims) == 4:
-            return self.table[
-                indices[:, 0], indices[:, 1], indices[:, 2], indices[:, 3]
-            ]
+            return self.table[indices[:, 0], indices[:, 1], indices[:, 2], indices[:, 3]]
 
 
 def lookup_neighbors(base_idx, neighbor_offsets, table):
@@ -153,9 +143,7 @@ def lookup_neighbors(base_idx, neighbor_offsets, table):
     neighbor_features = []
     for offset in neighbor_offsets:
         # Calculate neighbor index with wrap-around for each dimension
-        neighbor_idx = (
-            base_idx + torch.tensor(offset, device=base_idx.device)
-        ) % torch.tensor(table.dims, device=base_idx.device)
+        neighbor_idx = (base_idx + torch.tensor(offset, device=base_idx.device)) % torch.tensor(table.dims, device=base_idx.device)
         neighbor_features.append(table(neighbor_idx))
 
     # Concatenate and flatten the neighbor features
@@ -240,8 +228,9 @@ class GeometricProjectionMLP(nn.Module):
 
         # Feature MLP for original coordinates with non-linearity
         self.feature_mlp = nn.Sequential(
-            nn.Linear(feature_input_dim, hidden_dim),
-            nn.GELU(),
+            SwiGLU(),
+            nn.Linear(feature_input_dim, hidden_dim, bias=False),
+            RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, 3),
         )
 
@@ -250,24 +239,18 @@ class GeometricProjectionMLP(nn.Module):
 
     def forward(self, x, t=None):
         if self.has_t and t is None:
-            raise ValueError(
-                "t is required as this model was initialized with has_t=True"
-            )
+            raise ValueError("t is required as this model was initialized with has_t=True")
         # Compute distance from origin
         distance = torch.sqrt(torch.sum((x - self.origin) ** 2, dim=1, keepdim=True))
         # Compute alpha and beta angles
-        alpha = torch.atan2(x[:, 1] - self.origin[1], x[:, 0] - self.origin[0]).view(
-            -1, 1
-        )
+        alpha = torch.atan2(x[:, 1] - self.origin[1], x[:, 0] - self.origin[0]).view(-1, 1)
         beta = torch.acos((x[:, 2] - self.origin[2]) / distance).view(-1, 1)
 
         # Prepare inputs for the MLPs
         spherical_residual_input = torch.cat([alpha, beta, distance], dim=1)
         if self.has_t:
             t = t.view(-1, 1)  # Ensure t is correctly shaped
-            spherical_residual_input = torch.cat(
-                [spherical_residual_input, t], dim=1
-            )  # Append time if applicable
+            spherical_residual_input = torch.cat([spherical_residual_input, t], dim=1)  # Append time if applicable
         feature_input = torch.cat([x, t], dim=1) if self.has_t else x
 
         # Process through MLPs
@@ -300,6 +283,13 @@ def generate_space_time_offsets(spatial_offsets, temporal_offsets):
             combined_offsets.append(spatial_offset + (temporal_offset[3],))
 
     return combined_offsets
+
+
+# Swiglu or Gelu are popular activations
+class SwiGLU(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim=-1)
+        return F.silu(gate) * x
 
 
 # This is the authors attempt to impliment a naive lookup table version of instantNGP for videos over time
@@ -350,12 +340,8 @@ class SpaceTimeLookTable(nn.Module):
         (0, 0, 0, 8),
         (0, 0, 0, 64),
     ]
-    basic_space_time_offsets = generate_space_time_offsets(
-        face_directions + corner_directions, temporal_directions
-    )
-    exponential_time_offsets = generate_space_time_offsets(
-        basic_space_time_offsets, exponential_temporal_directions
-    )
+    basic_space_time_offsets = generate_space_time_offsets(face_directions + corner_directions, temporal_directions)
+    exponential_time_offsets = generate_space_time_offsets(basic_space_time_offsets, exponential_temporal_directions)
 
     def __init__(self, output_dim=4, inner_dim=64):
         super(SpaceTimeLookTable, self).__init__()
@@ -365,12 +351,8 @@ class SpaceTimeLookTable(nn.Module):
         self.table2 = LearnableLookupTable((32, 32, 32), 64 * 8 * 8)
         self.table3 = LearnableLookupTable((16, 16, 16), 64 * 8 * 8 * 8)
         # Define the lookup tables for temporal features
-        self.space_time_table_1 = LearnableLookupTable(
-            (16, 16, 16, 64), 64
-        )  # 16x16x16x64x64
-        self.space_time_table_2 = LearnableLookupTable(
-            (128, 128, 128, 128), 8
-        )  # 128x128x128x128x4
+        self.space_time_table_1 = LearnableLookupTable((16, 16, 16, 64), 64)  # 16x16x16x64x64
+        self.space_time_table_2 = LearnableLookupTable((128, 128, 128, 128), 8)  # 128x128x128x128x4
 
         # This table is low resolution soace and mostly carries high resolution
         # time data
@@ -404,14 +386,12 @@ class SpaceTimeLookTable(nn.Module):
         # Do one layer of linear+non-linear on features
         self.value_mlp = nn.Sequential(
             RMSNorm(total_feature_size),
+            SwiGLU(),
             nn.Linear(total_feature_size, inner_dim, bias=False),
-            nn.ReLU(),
         )
 
         # Final projection to color and alpha
-        self.final_projection = nn.Linear(
-            inner_dim + 3 + 1, output_dim
-        )  # Append dir and t
+        self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
 
     def forward(self, pos, dir, t):
         # Scale pos and t to the table sizes using the scale_indices method
@@ -421,10 +401,8 @@ class SpaceTimeLookTable(nn.Module):
         idx3 = self.table3.scale_indices(pos)
 
         # Combine pos and t for 4D indexing in space_time_table_1
-# Concatenate position and time for 4D tensor Bx4
-        pos_t = torch.cat(
-            [pos, t.unsqueeze(-1)], dim=-1
-        )  
+        # Concatenate position and time for 4D tensor Bx4
+        pos_t = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
         # Scale indices for space-time tables
         idx_space_time_table_1 = self.space_time_table_1.scale_indices(pos_t)
         idx_space_time_table_2 = self.space_time_table_2.scale_indices(pos_t)
@@ -448,16 +426,12 @@ class SpaceTimeLookTable(nn.Module):
         features3 = torch.cat([base_features3, neighbor_features3], dim=1)
         # All features tensors are of shape Bx((1+N)*C)xHxW
         # Lookup temporal features using the new utility function
-        spacetime_features_1 = lookup_neighbors(
-            t_idx, self.basic_space_time_offsets, self.space_time_table_1
-        )
-        spacetime_features_2 = lookup_neighbors(
-            t_idx, self.basic_space_time_offsets, self.space_time_table_2
-        )
+        spacetime_features_1 = lookup_neighbors(idx_space_time_table_1, self.basic_space_time_offsets, self.space_time_table_1)
+        spacetime_features_2 = lookup_neighbors(idx_space_time_table_2, self.basic_space_time_offsets, self.space_time_table_2)
 
-        time_focus_features = lookup_neighbors(
-            t_idx, self.exponential_time_offsets, self.time_focus_spacetime_table3
-        )
+        time_focus_features = lookup_neighbors(idx_time_focus, self.exponential_time_offsets, self.time_focus_spacetime_table3)
+
+        v
 
         # Concatenate all features
         all_features = torch.cat(
@@ -493,9 +467,7 @@ def get_model(model_name, input_dim=6):
     if model_name == "mlp":
         return MLP(input_dim=input_dim, inner_dim=512, output_dim=3, depth=5)
     elif model_name == "mlp-gauss":
-        return GaussianFeatureMLP(
-            input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0
-        )
+        return GaussianFeatureMLP(input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0)
     elif model_name == "spacetime-lookup":
 
         return SpaceTimeLookTable(
