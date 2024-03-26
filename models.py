@@ -582,15 +582,15 @@ class MoeSpaceTimeModel(nn.Module):
         self.input_dim = 4
 
         # Expert counts for tables
-        num_table_experts = 200
-        table_feature_size = 512
+        num_table_experts = 6
+        table_feature_size = 64
 
         self.table_moe = MoeLayer(
-            experts=nn.ModuleList([LearnableLookupTable((128, 128, 128, 512), table_feature_size) for _ in range(num_table_experts)]),
+            experts=nn.ModuleList([LearnableLookupTable((128, 128, 128, table_feature_size), table_feature_size) for _ in range(num_table_experts)]),
             gate=SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts),
             moe_args=MoeArgs(
                 num_experts=num_table_experts,
-                num_experts_per_tok=22,
+                num_experts_per_tok=8,
                 num_default_experts=2,
             ),
         )
@@ -664,5 +664,7 @@ def get_model(model_name, input_dim=6):
             output_dim=4,
             inner_dim=64,
         )
+    elif model_name == "moe-spacetime":
+        return MoeSpaceTimeModel()
     else:
         raise ValueError(f"Model {model_name} not found")
