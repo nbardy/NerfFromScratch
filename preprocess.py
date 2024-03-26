@@ -195,19 +195,14 @@ def process_video_frames(video_frames, cache_dir="cache"):
     return all_features
 
 
-def get_image_feature_difference_scores(video_frames: list[torch.Tensor], model, transforms) -> torch.Tensor:
+def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     """
     Calculates and returns a single value representing the average feature difference score
     for a sequence of video frames. This involves processing each frame through a given model to extract features,
     computing channel-wise mean running averages over different channel sizes (3, 5, 40), calculating channel-wise
     differences between low and high frequency averages, and then mean pooling across all channels to a single value per frame.
     """
-    all_features = []
-    for img in video_frames:
-        # Process each frame through the model to extract features
-        img_transformed = transforms(img).unsqueeze(0)  # Add batch dimension
-        features = model(img_transformed)  # Extract features
-        all_features.append(features)
+    all_features = process_video_frames(video_frames)
 
     # Convert list of features to tensor for batch processing: List of BxCxHxW -> BxTxCxHxW
     feature_frames_tensor = torch.stack(all_features, dim=1)  # BxTxCxHxW
