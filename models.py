@@ -123,12 +123,16 @@ class LearnableLookupTable(nn.Module):
         scaled_indices = (indices * (torch.tensor(self.dims).float() - 1)).long()
         return scaled_indices
 
-    def forward(self, indices):
+    def forward_without_scale(self, indices):
         # Indices should be scaled by the user before being passed to forward
         if len(self.dims) == 3:
             return self.table[indices[:, 0], indices[:, 1], indices[:, 2]]
         elif len(self.dims) == 4:
             return self.table[indices[:, 0], indices[:, 1], indices[:, 2], indices[:, 3]]
+
+    def forward(self, indices):
+        scaled_indices = self.scale_indices(indices)
+        return self.forward_without_scale(scaled_indices)
 
 
 def lookup_neighbors(base_idx, neighbor_offsets, table):
@@ -415,27 +419,33 @@ class SpaceTimeLookTable(nn.Module):
         idx_time_focus = self.time_focus_spacetime_table3.scale_indices(pos_t)
 
         # Get base features from spatial tables
-        base_features0 = self.table0(idx0)  # BxCxHxW
+        base_features0 = self.table0.forward_without_scale(idx0)  # BxCxHxW
         base_features1 = self.table1(idx1)  # BxCxHxW
         base_features2 = self.table2(idx2)  # BxCxHxW
         base_features3 = self.table3(idx3)  # BxCxHxW
 
         # Get neighbor features from spatial tables
-        neighbor_features0 = lookup_neighbors(idx0, self.face_directions, self.table0)
-        neighbor_features1 = lookup_neighbors(idx1, self.face_directions, self.table1)
-        neighbor_features2 = lookup_neighbors(idx2, self.face_directions, self.table2)
-        neighbor_features3 = lookup_neighbors(idx3, self.face_directions, self.table3)
+        neighbor_indices_0 = lookup_neighbors(idx0, self.face_directions, self.table0)
+        neighbor_indices_1 = lookup_neighbors(idx1, self.face_directions, self.table1)
+        neighbor_indices_2 = lookup_neighbors(idx2, self.face_directions, self.table2)
+        neighbor_indices_3 = lookup_neighbors(idx3, self.face_directions, self.table3)
+
+        neighbor_features0 = self.table0.forward_without_scale(neighbor_indices_0)
+        neighbor_features1 = self.table1.forward_without_scale(neighbor_indices_1)
+        neighbor_features2 = self.table2.forward_without_scale(neighbor_indices_2)
+        neighbor_features3 = self.table3.forward_without_scale(neighbor_indices_3)
+
+        # All features tensors are of shape Bx((1+N)*C)xHxW
+        # Lookup temporal features using the new utility function
+        spacetime_features_1 = self.space_time_table_1.forward_without_scale(idx_space_time_table_1)
+        spacetime_features_2 = self.space_time_table_2.forward_without_scale(idx_space_time_table_2)
+        time_focus_features = self.time_focus_spacetime_table3.forward_without_scale(idx_time_focus)
+
         # Combine base and neighbor features for all tables
         features0 = torch.cat([base_features0, neighbor_features0], dim=1)
         features1 = torch.cat([base_features1, neighbor_features1], dim=1)
         features2 = torch.cat([base_features2, neighbor_features2], dim=1)
         features3 = torch.cat([base_features3, neighbor_features3], dim=1)
-        # All features tensors are of shape Bx((1+N)*C)xHxW
-        # Lookup temporal features using the new utility function
-        spacetime_features_1 = lookup_neighbors(idx_space_time_table_1, self.basic_space_time_offsets, self.space_time_table_1)
-        spacetime_features_2 = lookup_neighbors(idx_space_time_table_2, self.basic_space_time_offsets, self.space_time_table_2)
-
-        time_focus_features = lookup_neighbors(idx_time_focus, self.exponential_time_offsets, self.time_focus_spacetime_table3)
 
         # Concatenate all features
         all_features = torch.cat(
@@ -607,10 +617,10 @@ class MoeSpaceTimeModel(nn.Module):
         x = torch.cat([pos, t.unsqueeze(-1)], dim=-1)  # Concatenate position and time
         all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
         geo_features_sum = torch.sum(all_geometric, dim=-1)  # Sum geometric features
+        geo_features_sum = torch.clamp(geo_features_sum, 0, 1)  # Clamp between 0 and 1 (this will convert to intege)
 
         all_table_values = self.table_moe(gate_inputs=geo_features_sum, inputs=geo_features_sum)  # Process summed geometric features through table MoE
         table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
-
         render_features = self.render_layer(gate_inputs=geo_features_sum, inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
