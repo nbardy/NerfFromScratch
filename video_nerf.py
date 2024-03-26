@@ -6,19 +6,13 @@ import torch
 import torch.nn as nn
 import wandb
 from PIL import Image
-from torchvision import transforms
 from einops import rearrange
-import cv2
 import torch.nn.functional as F
 import numpy as np
 import kornia
-
-
-from PIL import Image
-
 from models import get_model
 from utils import get_default_device
-from preprocess import blur_scores, video_difference_scores, deblur_video_vrt, load_video
+from preprocess import blur_scores, deblur_video_vrt, load_video, get_image_feature_difference_scores
 from peft import inject_adapter_in_model, LoraConfig
 
 from depth import image_depth
@@ -919,7 +913,7 @@ if __name__ == "__main__":
 
     if args.weight_blur_and_difference:
         blur_scores = blur_scores(video_frames)
-        differences = video_difference_scores(video_frames)
+        differences = get_image_feature_difference_scores(video_frames)
         # else none
     else:
         blur_scores = None

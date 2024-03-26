@@ -421,8 +421,10 @@ class SpaceTimeLookTable(nn.Module):
         idx3 = self.table3.scale_indices(pos)
 
         # Combine pos and t for 4D indexing in space_time_table_1
-        # Concatenate position and time for 4D tensor Bx4
-        pos_t = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
+# Concatenate position and time for 4D tensor Bx4
+        pos_t = torch.cat(
+            [pos, t.unsqueeze(-1)], dim=-1
+        )  
         # Scale indices for space-time tables
         idx_space_time_table_1 = self.space_time_table_1.scale_indices(pos_t)
         idx_space_time_table_2 = self.space_time_table_2.scale_indices(pos_t)
