@@ -3,6 +3,8 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
+from einops import rearrange
+
 from utils import get_default_device
 
 
@@ -10,6 +12,7 @@ import dataclasses
 from typing import List
 
 from simple_parsing.helpers import Serializable
+from transformers_model_code import GEGLU
 
 
 #  A simple MLP network
@@ -202,73 +205,55 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
 
+class SphericalEmbedding(nn.Module):
+    def __init__(self, input_dim_=3, projection_dim=8):
+        super(SphericalEmbedding, self).__init__()
+        self.projection_dim = projection_dim
+        self.random_projection = nn.Parameter(torch.randn(3, projection_dim))  # 3x8
+
+    def forward(self, x):
+        # x: Bx3
+        # Convert to spherical coordinates
+        rho = torch.sqrt(torch.sum(x**2, dim=-1, keepdim=True))  # Bx1
+        phi = torch.atan2(x[:, :, 1], x[:, :, 0])  # Bx1
+        theta = torch.acos(x[:, :, 2] / rho)  # Bx1
+
+        spherical_coords = torch.stack([rho, phi, theta], dim=-1)  # Bx3
+        # Project spherical coordinates to higher dimensions
+        projected = torch.einsum("bnd,df->bnf", spherical_coords, self.random_projection)  # Bx3x8
+
+        return projected
+
+
 class GeometricProjectionMLP(nn.Module):
-    """
-    A small MLP for projecting 3D points into a new 3D space
-
-    This represents a small learned geometric projection model. We use this to project arbitrary points in our 3D space
-    to a cube coordinate system. We need an evenly spaced cube to use our lookup table effectively.
-
-    To do this, we encode two MLPs:
-    1. A residual MLP to emit new 3-dimensional spherical coordinates (alpha, beta, distance) with optional time (t),
-       using only linear transformations to preserve the spherical coordinate information.
-    2. A feature MLP that processes the original coordinates (x, y, z) with non-linear transformations for enhanced representation.
-       (This should capture more local granular information)
-
-    The outputs of these MLPs are combined and passed through a sigmoid to compress arbitrary points in 3D space into a fixed size lookup table.
-    """
 
     def __init__(self, has_t=False):
         super(GeometricProjectionMLP, self).__init__()
-        self.origin = nn.Parameter(torch.zeros(3))  # Learnable origin
         self.has_t = has_t
-        # Define dimensions
-        residual_input_dim = 4 if has_t else 3  # alpha, beta, d, (optional t)
-        feature_input_dim = 6 if has_t else 3  # x, y, z, (optional t)
-        hidden_dim = 14
+        self.spherical_embedding = SphericalEmbedding(projection_dim=8)
+        feature_input_dim = 8 * 8 + (2 if has_t else 0)  # 8*8 for spherical embedding, +2 for cos(t) and sin(t)
 
-        # Residual MLP for spherical coordinates
-        self.residual_mlp = nn.Sequential(
-            nn.Linear(residual_input_dim, hidden_dim),
-            nn.Linear(hidden_dim, 3),
-        )
-
-        # Feature MLP for original coordinates with non-linearity
+        hidden_dim = 16
         self.feature_mlp = nn.Sequential(
-            nn.Linear(feature_input_dim, hidden_dim, bias=False),
-            SwiGLU(),
+            nn.Linear(feature_input_dim, hidden_dim),
+            GEGLU(),
             nn.Linear(hidden_dim, hidden_dim),
             RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, 3),
         )
-
-        # Sigmoid for 0 - 1
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x, t=None):
-        if self.has_t and t is None:
-            raise ValueError("t is required as this model was initialized with has_t=True")
-        # Compute distance from origin
-        distance = torch.sqrt(torch.sum((x - self.origin) ** 2, dim=1, keepdim=True))
-        # Compute alpha and beta angles
-        alpha = torch.atan2(x[:, 1] - self.origin[1], x[:, 0] - self.origin[0]).view(-1, 1)
-        beta = torch.acos((x[:, 2] - self.origin[2]) / distance).view(-1, 1)
-
-        # Prepare inputs for the MLPs
-        spherical_residual_input = torch.cat([alpha, beta, distance], dim=1)
+    def forward(self, x):
         if self.has_t:
-            t = t.view(-1, 1)  # Ensure t is correctly shaped
-            spherical_residual_input = torch.cat([spherical_residual_input, t], dim=1)  # Append time if applicable
-        feature_input = torch.cat([x, t], dim=1) if self.has_t else x
-
-        # Process through MLPs
-        spherical_residual_output = self.residual_mlp(spherical_residual_input)
-        feature_output = self.feature_mlp(feature_input)
-
-        # Combine outputs and apply sigmoid
-        combined_output = self.sigmoid(spherical_residual_output + feature_output)
-
-        return combined_output
+            xyz, t = x[:, :3], x[:, 3:]
+            t_features = torch.cat((torch.cos(t), torch.sin(t)), dim=-1)  # Bx2
+            x = self.spherical_embedding(xyz)  # Bx8*8
+            x = torch.cat((x, t_features), dim=-1)  # Bx(8*8+2)
+        else:
+            x = self.spherical_embedding(x)  # Bx8*8
+        x = self.feature_mlp(x)
+        x = self.sigmoid(x)
+        return x
 
 
 # This crosses offset lists of 3D and 4D space and time
@@ -291,13 +276,6 @@ def generate_space_time_offsets(spatial_offsets, temporal_offsets):
             combined_offsets.append(spatial_offset + (temporal_offset[3],))
 
     return combined_offsets
-
-
-# Swiglu or Gelu are popular activations
-class SwiGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return F.silu(gate) * x
 
 
 # This is the authors attempt to impliment a naive lookup table version of instantNGP for videos over time
@@ -351,7 +329,7 @@ class SpaceTimeLookTable(nn.Module):
     basic_space_time_offsets = generate_space_time_offsets(face_directions + corner_directions, temporal_directions)
     exponential_time_offsets = generate_space_time_offsets(basic_space_time_offsets, exponential_temporal_directions)
 
-    def __init__(self, output_dim=4, inner_dim=64):
+    def __init__(self, output_dim=4, inner_dim=64, use_attention=True):
         super(SpaceTimeLookTable, self).__init__()
         # Define the lookup tables for spatial features
         self.table0 = LearnableLookupTable((128, 128, 128), 64)
@@ -369,9 +347,12 @@ class SpaceTimeLookTable(nn.Module):
         # We sample 10 frames in each direction and we do it in 3 time steps
         self.time_focus_spacetime_table3 = LearnableLookupTable((4, 4, 4, 512 * 512), 8)
 
-        # We use one small geometric projection for all lookup tables
-        # This is used to project an arbitray scene of 3D points to a cube coordinate system for lookup
-        self.geom_proj_mlp = GeometricProjectionMLP(has_t=True)
+        from transformers_model_code import SpaceTimeEncoder
+
+        if use_attention:
+            self.geom_proj_mlp = SpaceTimeEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
+        else:
+            self.geom_proj_mlp = GeometricProjectionMLP(has_t=True)
 
         # Linear layer to downsize feature dimension and append viewing direction
         # The input dimension calculation is broken down as follows:
@@ -392,13 +373,17 @@ class SpaceTimeLookTable(nn.Module):
             + 8 * (11 * 8)
         )
 
-        # Do one layer of linear+non-linear on features
-        self.value_mlp = nn.Sequential(
-            RMSNorm(total_feature_size),
-            nn.Linear(total_feature_size, inner_dim, bias=False),
-            SwiGLU(),
-            nn.Linear(inner_dim, inner_dim),
-        )
+        if use_attention:
+            self.value_mlp = SpaceTimeEncoder(
+                input_dim=total_feature_size, output_dim=inner_dim, embedding_depth=8, projection_dim=inner_dim, heads=8, model_depth=1
+            )
+        else:
+            self.value_mlp = nn.Sequential(
+                RMSNorm(total_feature_size),
+                nn.Linear(total_feature_size, total_feature_size * 2, bias=False),
+                GEGLU(),
+                nn.Linear(total_feature_size * 2, inner_dim, bias=False),
+            )
 
         # Final projection to color and alpha
         self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
@@ -556,7 +541,7 @@ class MoeLayer(nn.Module):
 #  This wrap our other model layers with MoE
 #
 class MoeSpaceTimeModel(nn.Module):
-    def __init__(self):
+    def __init__(self, use_attention_geo=True, use_attention_render=True):
         super(MoeSpaceTimeModel, self).__init__()
 
         self.input_dim = 4
@@ -566,9 +551,16 @@ class MoeSpaceTimeModel(nn.Module):
         table_size = (64, 64, 64, 128)
         table_feature_size = 16
 
+        from transformers_model_code import SpaceTimeSphericalTransformerEncoder, TransformerEncoder
+
+        # Let's setup our classes
+        render_class = TransformerEncoder if use_attention_render else SegGLUMLP
+        geo_class = SpaceTimeSphericalTransformerEncoder if use_attention_geo else GeometricProjectionMLP
+        make_gate = lambda: SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts)
+
         self.table_moe = MoeLayer(
             experts=nn.ModuleList([LearnableLookupTable(table_size, table_feature_size) for _ in range(num_table_experts)]),
-            gate=SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts),
+            gate=make_gate(),
             moe_args=MoeArgs(
                 num_experts=num_table_experts,
                 num_experts_per_tok=8,
@@ -578,7 +570,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         num_geo_experts = 8
         self.geometric_layer = MoeLayer(
-            experts=nn.ModuleList([GeometricProjectionMLP(has_t=True) for _ in range(num_geo_experts)]),
+            experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts)]),
             gate=SegGLUMLP(4, 16, output_dim=num_geo_experts),
             moe_args=MoeArgs(
                 num_experts=num_geo_experts,
@@ -593,7 +585,7 @@ class MoeSpaceTimeModel(nn.Module):
         num_render_experts = 8
         render_feature_size = 8
         self.render_layer = MoeLayer(
-            experts=nn.ModuleList([SegGLUMLP(scene_feature_size, inner_dim=64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
+            experts=nn.ModuleList([render_class(scene_feature_size, inner_dim=64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
             gate=SegGLUMLP(4, 16, output_dim=num_render_experts),
             moe_args=MoeArgs(
                 num_experts=num_render_experts,
