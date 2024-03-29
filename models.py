@@ -554,24 +554,14 @@ class MoeSpaceTimeModel(nn.Module):
         from transformers_model_code import SpaceTimeSphericalTransformerEncoder, TransformerEncoder
 
         # Let's setup our classes
-        render_class = TransformerEncoder if use_attention_render else SegGLUMLP
         geo_class = SpaceTimeSphericalTransformerEncoder if use_attention_geo else GeometricProjectionMLP
+        render_class = TransformerEncoder if use_attention_render else SegGLUMLP
         make_gate = lambda: SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts)
-
-        self.table_moe = MoeLayer(
-            experts=nn.ModuleList([LearnableLookupTable(table_size, table_feature_size) for _ in range(num_table_experts)]),
-            gate=make_gate(),
-            moe_args=MoeArgs(
-                num_experts=num_table_experts,
-                num_experts_per_tok=8,
-                num_default_experts=2,
-            ),
-        )
 
         num_geo_experts = 8
         self.geometric_layer = MoeLayer(
             experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts)]),
-            gate=SegGLUMLP(4, 16, output_dim=num_geo_experts),
+            gate=make_gate(),
             moe_args=MoeArgs(
                 num_experts=num_geo_experts,
                 num_experts_per_tok=1,
@@ -582,11 +572,21 @@ class MoeSpaceTimeModel(nn.Module):
         num_active_tables = 22 + 2
         scene_feature_size = num_active_tables * table_feature_size
 
+        self.table_moe = MoeLayer(
+            experts=nn.ModuleList([LearnableLookupTable(table_size, table_feature_size) for _ in range(num_table_experts)]),
+            gate=make_gate(),
+            moe_args=MoeArgs(
+                num_experts=num_table_experts,
+                num_experts_per_tok=num_active_tables,
+                num_default_experts=2,
+            ),
+        )
+
         num_render_experts = 8
         render_feature_size = 8
         self.render_layer = MoeLayer(
             experts=nn.ModuleList([render_class(scene_feature_size, inner_dim=64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
-            gate=SegGLUMLP(4, 16, output_dim=num_render_experts),
+            gate=make_gate(),
             moe_args=MoeArgs(
                 num_experts=num_render_experts,
                 num_experts_per_tok=2,
@@ -609,7 +609,7 @@ class MoeSpaceTimeModel(nn.Module):
         x = torch.cat([pos, t.unsqueeze(-1)], dim=-1)  # Concatenate position and time
         all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
         geo_features_sum = torch.sum(all_geometric, dim=-1)  # Sum geometric features
-        geo_features_sum = torch.clamp(geo_features_sum, 0, 1)  # Clamp between 0 and 1 (this will convert to intege)
+        geo_features_sum = torch.clamp(geo_features_sum, 0, 1)  # Clamp between 0 and 1 to fix the domain shift above each invidual layer outputs 0-1
 
         all_table_values = self.table_moe(gate_inputs=geo_features_sum, inputs=geo_features_sum)  # Process summed geometric features through table MoE
         table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features

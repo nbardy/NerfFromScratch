@@ -1,18 +1,19 @@
-import pickle
 import torchvision
 import subprocess
 import shutil
 from pathlib import Path
-import torch
 import kornia as K
 
 import requests
 import time
-
 import os
-from urllib.request import urlopen
 import torch
-import timm
+from utils import get_default_device
+from tqdm import tqdm
+
+from transformers import AutoModel, AutoProcessor
+import pickle
+from utils import get_default_device
 
 
 # Define a global dictionary to cache models
@@ -51,13 +52,13 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     return blur_score.item()
 
 
-def generate_hash_and_cache_path(video_frames: list[torch.Tensor]) -> Path:
+def generate_hash_and_cache_path(video_frames: list[torch.Tensor], key: str) -> Path:
     """
     Generates a hash from the video frames and constructs a cache path.
     """
     video_frames_bytes = [frame.cpu().numpy().tobytes() for frame in video_frames]  # Convert frames to bytes
     video_frames_hash = hash(tuple(video_frames_bytes))  # Hash the bytes for a unique identifier
-    return Path(f"cache/{video_frames_hash}_blur_scores.pt")  # Construct cache file path using hash
+    return Path(f"cache/{video_frames_hash}_{key}.pt")  # Construct cache file path using hash
 
 
 def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
@@ -65,13 +66,12 @@ def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
     and attempts to load from cache if available. Returns a tensor of scores.
     """
-    print(video_frames)
     print(type(video_frames))
     # print ype of first frame
     print(video_frames[0].shape)
     # Step 1: Hash video frames for cache key
 
-    cache_path = generate_hash_and_cache_path(video_frames)
+    cache_path = generate_hash_and_cache_path(video_frames, key="blur_scores_done")
 
     # Step 2: Check if cache exists and load it
     if cache_path.exists():
@@ -137,49 +137,45 @@ def deblur_video_vrt(
 model_cache = {}
 
 
-def load_timm_model(model_name="efficientvit_m5.r224_in1k", pretrained=True, features_only=False, num_classes=None):
-    """
-    Load and cache a model from timm library.
-    """
-    key = f"{model_name}_{'pretrained' if pretrained else 'scratch'}_{'features' if features_only else 'full'}_{num_classes if num_classes else 'default'}"
-    if key not in model_cache:
-        model = timm.create_model(model_name, pretrained=pretrained, features_only=features_only, num_classes=num_classes)
-        model.eval()
-        model_cache[key] = model
-    return model_cache[key]
-
-
 def process_video_frames(video_frames):
     """
-    Process video frames using EfficientViT model for features
+    Process video frames using SigLIP model for features
     """
     # Ensure cache directory exists
-    cache_file = generate_hash_and_cache_path(video_frames)
+    cache_file = generate_hash_and_cache_path(video_frames, key="processed_features")
+    device = get_default_device()
 
     if cache_file.exists():
         print(f"Loading processed data from {cache_file}")
         with open(cache_file, "rb") as f:
             all_features = pickle.load(f)
+        return all_features
     else:
         all_features = []
-        model = load_timm_model("efficientvit_m5.r224_in1k", pretrained=True)
+        image_model = "google/siglip-base-patch16-512"
+        model = AutoModel.from_pretrained(image_model)
+        processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-512")
+        model.to(device)  # Move model to appropriate device
 
+        # Initialize progress bar
+        progress_bar = tqdm(total=len(video_frames), desc="Processing Frames")
+
+        # Process each frame and collect features
         for img in video_frames:
-            # Image Classification
-            data_config = timm.data.resolve_model_data_config(model)
-            transforms = timm.data.create_transform(**data_config, is_training=False)
-            output = model(transforms(img).unsqueeze(0))
-            top5_probabilities, top5_class_indices = torch.topk(output.softmax(dim=1) * 100, k=5)
+            inputs = processor(images=img, return_tensors="pt").to(device)  # Prepare inputs and move to device
+            with torch.no_grad():  # Ensure no gradients are calculated
+                outputs = model(**inputs)
+                image_embeds = outputs.image_embeds  # Extract image embeddings
+            all_features.append(image_embeds.cpu())  # Move output back to CPU
+            progress_bar.update(1)  # Update progress bar
 
-            output = model(transforms(img).unsqueeze(0))
+        progress_bar.close()  # Close progress bar
 
-            # Save processed data to cache
-            print(f"Processed data saved to {cache_file}")
-
-            all_features.append(output)
-
+        # Save processed data to cache
         with open(cache_file, "wb") as f:
             pickle.dump(all_features, f)
+        print(f"Processed data saved to {cache_file}")
+
         unload_model(model)
 
         return all_features
@@ -215,13 +211,6 @@ def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> tor
     final_diff_scores = final_diff_scores.mean(dim=[2, 3])  # Bx(T-39)x1
 
     return final_diff_scores  # Bx(T-39)
-
-
-# Example usage
-if __name__ == "__main__":
-    video_path = "path/to/your/video.mp4"
-    processed_data = process_video_frames(video_path)
-    print(processed_data)
 
 
 def unload_model(model):
@@ -299,5 +288,6 @@ def main():
     print(f"Processing completed in {end_time - start_time:.2f} seconds.")
 
 
+# Example usage
 if __name__ == "__main__":
     main()
