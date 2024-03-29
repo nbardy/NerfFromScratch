@@ -347,10 +347,10 @@ class SpaceTimeLookTable(nn.Module):
         # We sample 10 frames in each direction and we do it in 3 time steps
         self.time_focus_spacetime_table3 = LearnableLookupTable((4, 4, 4, 512 * 512), 8)
 
-        from transformers_model_code import SpaceTimeEncoder
+        from transformers_model_code import SpaceTimeTransformerEncoder
 
         if use_attention:
-            self.geom_proj_mlp = SpaceTimeEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
+            self.geom_proj_mlp = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
         else:
             self.geom_proj_mlp = GeometricProjectionMLP(has_t=True)
 
@@ -478,26 +478,29 @@ class SpaceTimeLookTable(nn.Module):
 # modern transformers researc
 ##
 # We use this for gating and render layers
+#
+# Recent Transformer work has shown stability in scaling training with
+#
+# gated activation units, silu does that well. We use a simple sin/cos
+# embedding to fix standard MLP bias with high frequencies.
 class SegGLUMLP(nn.Module):
     def __init__(self, input_dim, inner_dim, output_dim):
         super(SegGLUMLP, self).__init__()
-        assert inner_dim % 4 == 0
 
-        self.projection = nn.Linear(input_dim, inner_dim // 4)
+        self.seglu_embed = lambda x, y: torch.cat((torch.sin(x), torch.sin(F.silu(x)), torch.cos(y), torch.cos(F.silu(y))), dim=-1)  # * 4 the size
+        self.seglu = lambda x: torch.cat([x, F.silu(x)], dim=-1)
+
         self.mlp = nn.Sequential(
-            nn.Linear(inner_dim, inner_dim),
             RMSNorm(inner_dim),
-            nn.Linear(inner_dim, output_dim),
+            self.seglu_embed,
+            nn.Linear(input_dim * 4, inner_dim),
+            self.seglu(),
+            RMSNorm(inner_dim),
+            nn.Linear(inner_dim * 2, output_dim),
         )
 
     def forward(self, x):
-        x_proj = self.projection(x)
-        sin_x = torch.sin(x_proj)
-        cos_x = torch.cos(x_proj)
-        x = torch.cat((sin_x, F.silu(sin_x), cos_x, F.silu(cos_x)), dim=-1)  # * 4 the size
-        x = self.mlp(x)
-
-        return x
+        return self.mlp(x)
 
 
 @dataclasses.dataclass
@@ -551,10 +554,10 @@ class MoeSpaceTimeModel(nn.Module):
         table_size = (64, 64, 64, 128)
         table_feature_size = 16
 
-        from transformers_model_code import SpaceTimeSphericalTransformerEncoder, TransformerEncoder
+        from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
         # Let's setup our classes
-        geo_class = SpaceTimeSphericalTransformerEncoder if use_attention_geo else GeometricProjectionMLP
+        geo_class = SpaceTimeTransformerEncoder if use_attention_geo else GeometricProjectionMLP
         render_class = TransformerEncoder if use_attention_render else SegGLUMLP
         make_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
 

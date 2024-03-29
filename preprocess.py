@@ -1,8 +1,8 @@
-import torchvision
 import subprocess
 import shutil
 from pathlib import Path
 import kornia as K
+import torchvision
 
 import requests
 import time
@@ -11,9 +11,11 @@ import torch
 from utils import get_default_device
 from tqdm import tqdm
 
-from transformers import AutoModel, AutoProcessor
-import pickle
+
 from utils import get_default_device
+from torchmetrics.aggregation import RunningMean
+
+from einops import rearrange
 
 
 # Define a global dictionary to cache models
@@ -54,14 +56,18 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
 
 def generate_hash_and_cache_path(video_frames: list[torch.Tensor], key: str) -> Path:
     """
-    Generates a hash from the video frames and constructs a cache path.
+    Generates a consistent hash from the video frames and constructs a cache path.
     """
-    video_frames_bytes = [frame.cpu().numpy().tobytes() for frame in video_frames]  # Convert frames to bytes
-    video_frames_hash = hash(tuple(video_frames_bytes))  # Hash the bytes for a unique identifier
+    import hashlib
+
+    hasher = hashlib.sha256()
+    for frame in video_frames:
+        hasher.update(frame.cpu().numpy().tobytes())  # Update hash with frame bytes
+    video_frames_hash = hasher.hexdigest()  # Get hexadecimal digest for the hash
     return Path(f"cache/{video_frames_hash}_{key}.pt")  # Construct cache file path using hash
 
 
-def blur_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
+def blur_scores(video_frames: list[torch.Tensor], cache_key=None) -> torch.Tensor:
     """
     Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
     and attempts to load from cache if available. Returns a tensor of scores.
@@ -139,27 +145,33 @@ model_cache = {}
 
 def process_video_frames(video_frames):
     """
-    Process video frames using Swin Transformer model for features
+    Process video frames using Swin Transformer model for features and store them using SafeTensors
     """
     from transformers import AutoFeatureExtractor, Swinv2Model
     import torch
-    import pickle
+    from safetensors.torch import save_file
+    from safetensors import safe_open
     from pathlib import Path
     from tqdm.auto import tqdm
 
     # Ensure cache directory exists
-    cache_file = generate_hash_and_cache_path(video_frames, key="processed_features_swin")
+    cache_path = generate_hash_and_cache_path(video_frames, key="processed_features_swin")
+    cache_file = str(cache_path) + ".safetensors"
     device = get_default_device()
 
     print("==")
     print("Checking cache for", cache_file)
-    if cache_file.exists():
+    if Path(cache_file).exists():
         print("Cache found, loading from", cache_file)
         print("==")
         print(f"Loading processed data from {cache_file}")
-        with open(cache_file, "rb") as f:
-            all_features = pickle.load(f)
-        return all_features
+        all_features_tensor = None
+        with safe_open(cache_file, framework="pt", device="cpu") as f:
+            # all_features_tensor = f.get_tensor("all_features")
+            all_features_tensor = f.get_tensor("all_features")
+            # to device
+            all_features_tensor = all_features_tensor.to(device)
+        return all_features_tensor
     else:
         print("Cache not found, processing from scratch")
         print("==")
@@ -184,14 +196,22 @@ def process_video_frames(video_frames):
 
         progress_bar.close()  # Close progress bar
 
-        # Save processed data to cache
-        with open(cache_file, "wb") as f:
-            pickle.dump(all_features, f)
+        # Simplify tensor reshaping and squeezing using einops
+
+        # Rearrange a list of T tensors each of shape 1xPxD to a single tensor of shape TxPxD
+        stacked_features = torch.stack(all_features)  # Bx1xPxD
+        all_features_tensor = rearrange(stacked_features, "t 1 p d -> t p d")  # Tx1xPxD -> TxPxD
+
+        # Save processed data to cache using SafeTensors
+        save_file({"all_features": all_features_tensor}, cache_file)
         print(f"Processed data saved to {cache_file}")
 
         unload_model(model)
 
-        return all_features
+        # Ensure the shape of the tensor is as expected
+        assert all_features_tensor.shape[1:] == (64, 768), "Shape mismatch, expected Tx64x768"
+
+        return all_features_tensor
 
 
 from einops import rearrange, reduce
@@ -200,46 +220,64 @@ from einops import rearrange, reduce
 def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     """
     Calculates and returns a single value representing the average feature difference score
-    for a sequence of video frames. This involves processing each frame through a given model to extract features,
-    computing channel-wise mean running averages over different channel sizes (3, 5, 40), calculating channel-wise
-    differences between low and high frequency averages, and then mean pooling across all channels to a single value per frame.
+
+    We take features at 3 different time scales and calculate differences between them.
+
+    Then we normalize and sum to boost the differences between the 3 time scales in our sampling rate
+    This returns a score per frame.
     """
 
     print("====")
     print("Processing video frames")
     print("====")
-    all_features = process_video_frames(video_frames)
+    all_features = process_video_frames(video_frames)  # TxPxD
     print("====")
     print("Processing video frames done")
     print("====")
 
-    # Convert list of features to tensor for batch processing: List of BxTxD -> TxPxD
-    feature_frames_tensor = torch.stack(all_features, dim=0)  # TxPxD
-    print(f"feature_frames_tensor shape: {feature_frames_tensor.shape}")  # Debug print
+    feature_frames_tensor = all_features
+    # Calculate mean running averages for specified channel sizes, channel-wise, using tensor operations for efficiency
+    # Initialize tensors to store running averages
+    avg_3 = torch.zeros_like(feature_frames_tensor)  # TxPxD
+    avg_5 = torch.zeros_like(feature_frames_tensor)  # TxPxD
+    avg_40 = torch.zeros_like(feature_frames_tensor)  # TxPxD
 
-    # Given the tensor shape [T, P, D], we adjust the reduction pattern to work with the actual dimensions
-    # Calculate mean running averages for specified channel sizes, channel-wise
-    avg_3 = reduce(feature_frames_tensor, "t p (d 3) -> t p d", "mean")  # TxPxD
-    print(f"avg_3 shape: {avg_3.shape}")  # Debug print
-    avg_5 = reduce(feature_frames_tensor, "t p (d 5) -> t p d", "mean")  # TxPxD
-    print(f"avg_5 shape: {avg_5.shape}")  # Debug print
-    avg_40 = reduce(feature_frames_tensor, "t p (d 40) -> t p d", "mean")  # TxPxD
-    print(f"avg_40 shape: {avg_40.shape}")  # Debug print
+    # take first n-2, n-1, n
+    current_avg_3 = feature_frames_tensor[:3].mean(dim=0, keepdim=True)
+    current_avg_5 = feature_frames_tensor[:5].mean(dim=0, keepdim=True)
+    current_avg_40 = feature_frames_tensor[:40].mean(dim=0, keepdim=True)
+
+    # Calculate running averages without explicit loops, leveraging tensor operations for GPU acceleration
+    for i, _ in enumerate(video_frames):
+        # insert at
+        avg_3[i] = current_avg_3
+        avg_5[i] = current_avg_5
+        avg_40[i] = current_avg_40
+        # update current averages
+        alpha_3 = 2.0 / (3 + 1)
+        alpha_5 = 2.0 / (5 + 1)
+        alpha_40 = 2.0 / (40 + 1)
+        current_avg_3 = alpha_3 * feature_frames_tensor[i] + (1 - alpha_3) * current_avg_3
+        current_avg_5 = alpha_5 * feature_frames_tensor[i] + (1 - alpha_5) * current_avg_5
+        current_avg_40 = alpha_40 * feature_frames_tensor[i] + (1 - alpha_40) * current_avg_40
 
     # Calculate channel-wise differences between low and high frequency averages
-    # Adjusting the calculation to work with the corrected avg tensor shapes
-    diff_3_40 = torch.abs(avg_3 - avg_40[:, : avg_3.size(1), :])  # TxPxD
-    print(f"diff_3_40 shape: {diff_3_40.shape}")  # Debug print
-    diff_5_40 = torch.abs(avg_5 - avg_40[:, : avg_5.size(1), :])  # TxPxD
-    print(f"diff_5_40 shape: {diff_5_40.shape}")  # Debug print
+    diff_short_term = torch.abs(avg_3 - avg_5)  # TxPxD
+    diff_long_term = torch.abs(avg_5 - avg_40)  # TxPxD
+
+    # Apply soft sigmoid for initial normalization
+    diff_short_term_soft = torch.sigmoid(diff_short_term)  # TxPxD
+    diff_long_term_soft = torch.sigmoid(diff_long_term)  # TxPxD
+
+    # Exponential rescaling to force max to be 1 and min to be 0
+    diff_short_term_norm = torch.exp(diff_short_term_soft) / torch.exp(diff_short_term_soft).max()  # TxPxD
+    diff_long_term_norm = torch.exp(diff_long_term_soft) / torch.exp(diff_long_term_soft).max()  # TxPxD
+    # Weighted sum of normalized differences
+    weighted_diff = 0.2 * diff_short_term_norm + 0.8 * diff_long_term_norm  # TxPxD
 
     # Mean pooling across all channels to a single value per frame
-    # Adjusting the reduction to work with the corrected diff tensor shapes
-    mean_diff_3_40 = reduce(diff_3_40, "t p d -> t", "mean")  # T
-    print(f"mean_diff_3_40 shape: {mean_diff_3_40.shape}")  # Debug print
-    mean_diff_5_40 = reduce(diff_5_40, "t p d -> t", "mean")  # T
-    print(f"mean_diff_5_40 shape: {mean_diff_5_40.shape}")  # Debug print
-    final_diff_scores = (mean_diff_3_40 + mean_diff_5_40) / 2.0  # T
+    final_diff_scores = reduce(weighted_diff, "t p d -> t", "mean")  # T
+
     print(f"final_diff_scores shape: {final_diff_scores.shape}")  # Debug print
 
     return final_diff_scores  # T
@@ -271,6 +309,7 @@ def unload_model(model):
 
 
 def load_video(video_path, max_frames=None):
+
     video_frames, _, _ = torchvision.io.read_video(video_path, pts_unit="sec")
     video_frames = video_frames.float() / 255.0  # Convert to float and normalize
     if max_frames is not None:

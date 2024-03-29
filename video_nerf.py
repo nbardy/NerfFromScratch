@@ -10,6 +10,7 @@ from einops import rearrange
 import torch.nn.functional as F
 import numpy as np
 import kornia
+
 from models import get_model
 from utils import get_default_device
 from preprocess import blur_scores, deblur_video_vrt, load_video, get_image_feature_difference_scores
@@ -791,7 +792,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--validation_steps", type=int, default=40)
     parser.add_argument("--video_validation_steps", type=int, default=50)
-    parser.add_argument("--model", type=str, default="spacetime-lookup", help="Model to use")
+    parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to use")
     parser.add_argument(
         "--max_frames",
         type=int,
