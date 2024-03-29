@@ -139,22 +139,34 @@ model_cache = {}
 
 def process_video_frames(video_frames):
     """
-    Process video frames using SigLIP model for features
+    Process video frames using Swin Transformer model for features
     """
+    from transformers import AutoFeatureExtractor, Swinv2Model
+    import torch
+    import pickle
+    from pathlib import Path
+    from tqdm.auto import tqdm
+
     # Ensure cache directory exists
-    cache_file = generate_hash_and_cache_path(video_frames, key="processed_features")
+    cache_file = generate_hash_and_cache_path(video_frames, key="processed_features_swin")
     device = get_default_device()
 
+    print("==")
+    print("Checking cache for", cache_file)
     if cache_file.exists():
+        print("Cache found, loading from", cache_file)
+        print("==")
         print(f"Loading processed data from {cache_file}")
         with open(cache_file, "rb") as f:
             all_features = pickle.load(f)
         return all_features
     else:
+        print("Cache not found, processing from scratch")
+        print("==")
         all_features = []
-        image_model = "google/siglip-base-patch16-512"
-        model = AutoModel.from_pretrained(image_model)
-        processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-512")
+        image_model = "microsoft/swinv2-tiny-patch4-window8-256"
+        model = Swinv2Model.from_pretrained(image_model)
+        feature_extractor = AutoFeatureExtractor.from_pretrained(image_model)
         model.to(device)  # Move model to appropriate device
 
         # Initialize progress bar
@@ -162,11 +174,12 @@ def process_video_frames(video_frames):
 
         # Process each frame and collect features
         for img in video_frames:
-            inputs = processor(images=img, return_tensors="pt").to(device)  # Prepare inputs and move to device
+            inputs = feature_extractor(images=img, return_tensors="pt").to(device)  # Prepare inputs and move to device
             with torch.no_grad():  # Ensure no gradients are calculated
                 outputs = model(**inputs)
-                image_embeds = outputs.image_embeds  # Extract image embeddings
-            all_features.append(image_embeds.cpu())  # Move output back to CPU
+
+                last_hidden_states = outputs.last_hidden_state  # Extract last hidden states as features
+            all_features.append(last_hidden_states.cpu())  # Move output back to CPU
             progress_bar.update(1)  # Update progress bar
 
         progress_bar.close()  # Close progress bar
@@ -181,6 +194,9 @@ def process_video_frames(video_frames):
         return all_features
 
 
+from einops import rearrange, reduce
+
+
 def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
     """
     Calculates and returns a single value representing the average feature difference score
@@ -188,29 +204,45 @@ def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> tor
     computing channel-wise mean running averages over different channel sizes (3, 5, 40), calculating channel-wise
     differences between low and high frequency averages, and then mean pooling across all channels to a single value per frame.
     """
+
+    print("====")
+    print("Processing video frames")
+    print("====")
     all_features = process_video_frames(video_frames)
+    print("====")
+    print("Processing video frames done")
+    print("====")
 
-    # Convert list of features to tensor for batch processing: List of BxCxHxW -> BxTxCxHxW
-    feature_frames_tensor = torch.stack(all_features, dim=1)  # BxTxCxHxW
+    # Convert list of features to tensor for batch processing: List of BxTxD -> TxPxD
+    feature_frames_tensor = torch.stack(all_features, dim=0)  # TxPxD
+    print(f"feature_frames_tensor shape: {feature_frames_tensor.shape}")  # Debug print
 
+    # Given the tensor shape [T, P, D], we adjust the reduction pattern to work with the actual dimensions
     # Calculate mean running averages for specified channel sizes, channel-wise
-    avg_3 = feature_frames_tensor.unfold(1, 3, 1).mean(dim=2)  # Bx(T-2)xCxHxW
-    avg_5 = feature_frames_tensor.unfold(1, 5, 1).mean(dim=2)  # Bx(T-4)xCxHxW
-    avg_40 = feature_frames_tensor.unfold(1, 40, 1).mean(dim=2)  # Bx(T-39)xCxHxW
+    avg_3 = reduce(feature_frames_tensor, "t p (d 3) -> t p d", "mean")  # TxPxD
+    print(f"avg_3 shape: {avg_3.shape}")  # Debug print
+    avg_5 = reduce(feature_frames_tensor, "t p (d 5) -> t p d", "mean")  # TxPxD
+    print(f"avg_5 shape: {avg_5.shape}")  # Debug print
+    avg_40 = reduce(feature_frames_tensor, "t p (d 40) -> t p d", "mean")  # TxPxD
+    print(f"avg_40 shape: {avg_40.shape}")  # Debug print
 
     # Calculate channel-wise differences between low and high frequency averages
-    diff_3_40 = torch.abs(avg_3[:, : avg_40.size(1)] - avg_40)  # Bx(T-39)xCxHxW
-    diff_5_40 = torch.abs(avg_5[:, : avg_40.size(1)] - avg_40)  # Bx(T-39)xCxHxW
+    # Adjusting the calculation to work with the corrected avg tensor shapes
+    diff_3_40 = torch.abs(avg_3 - avg_40[:, : avg_3.size(1), :])  # TxPxD
+    print(f"diff_3_40 shape: {diff_3_40.shape}")  # Debug print
+    diff_5_40 = torch.abs(avg_5 - avg_40[:, : avg_5.size(1), :])  # TxPxD
+    print(f"diff_5_40 shape: {diff_5_40.shape}")  # Debug print
 
     # Mean pooling across all channels to a single value per frame
-    mean_diff_3_40 = diff_3_40.mean(dim=2)  # Bx(T-39)xHxW -> Bx(T-39)x1xW
-    mean_diff_5_40 = diff_5_40.mean(dim=2)  # Bx(T-39)xHxW -> Bx(T-39)x1xW
-    final_diff_scores = (mean_diff_3_40 + mean_diff_5_40) / 2.0  # Bx(T-39)x1xW
+    # Adjusting the reduction to work with the corrected diff tensor shapes
+    mean_diff_3_40 = reduce(diff_3_40, "t p d -> t", "mean")  # T
+    print(f"mean_diff_3_40 shape: {mean_diff_3_40.shape}")  # Debug print
+    mean_diff_5_40 = reduce(diff_5_40, "t p d -> t", "mean")  # T
+    print(f"mean_diff_5_40 shape: {mean_diff_5_40.shape}")  # Debug print
+    final_diff_scores = (mean_diff_3_40 + mean_diff_5_40) / 2.0  # T
+    print(f"final_diff_scores shape: {final_diff_scores.shape}")  # Debug print
 
-    # Mean pooling across width and height to get a single value
-    final_diff_scores = final_diff_scores.mean(dim=[2, 3])  # Bx(T-39)x1
-
-    return final_diff_scores  # Bx(T-39)
+    return final_diff_scores  # T
 
 
 def unload_model(model):

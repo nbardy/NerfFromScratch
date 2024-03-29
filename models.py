@@ -556,7 +556,7 @@ class MoeSpaceTimeModel(nn.Module):
         # Let's setup our classes
         geo_class = SpaceTimeSphericalTransformerEncoder if use_attention_geo else GeometricProjectionMLP
         render_class = TransformerEncoder if use_attention_render else SegGLUMLP
-        make_gate = lambda: SegGLUMLP(4, inner_dim=16, output_dim=num_table_experts)
+        make_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
 
         num_geo_experts = 8
         self.geometric_layer = MoeLayer(
