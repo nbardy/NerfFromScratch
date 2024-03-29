@@ -207,7 +207,7 @@ class RMSNorm(nn.Module):
 
 # Projects a spherical point to a higher dimension embedding
 class SphericalEmbedding(nn.Module):
-    def __init__(self, input_dim_=3, projection_dim=8):
+    def __init__(self, projection_dim=8):
         super(SphericalEmbedding, self).__init__()
         self.projection_dim = projection_dim
         self.random_projection = nn.Parameter(torch.randn(3, projection_dim))  # 3x8
@@ -241,7 +241,7 @@ class TimeEmbedding(nn.Module):
 
 
 class SpacetimeGeometricProjectionMLP(nn.Module):
-    def __init__(self, has_t=False):
+    def __init__(self, inner_bias=False):
         super(SpacetimeGeometricProjectionMLP, self).__init__()
         self.spherical_embedding = SphericalEmbedding(projection_dim=8)
         self.time_embedding = TimeEmbedding()
@@ -250,15 +250,14 @@ class SpacetimeGeometricProjectionMLP(nn.Module):
         hidden_dim = 16
         self.feature_mlp = nn.Sequential(
             RMSNorm(feature_input_dim),
-            nn.Linear(feature_input_dim, hidden_dim * 2),
+            nn.Linear(feature_input_dim, hidden_dim * 2, bias=inner_bias),
             GEGLU(),
             RMSNorm(feature_input_dim),
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim * 2, bias=inner_bias),
             GEGLU(),
             RMSNorm(hidden_dim),
             nn.Linear(hidden_dim, 4),
         )
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, t=None):
         spherical_embedded = self.spherical_embedding(x)  # Bx8*8
@@ -266,7 +265,6 @@ class SpacetimeGeometricProjectionMLP(nn.Module):
         x = torch.cat([spherical_embedded, time_embedded], dim=-1)  # Bx(8*8+4)
 
         x = self.feature_mlp(x)  # Bx4 after MLP
-        x = self.sigmoid(x)  # Bx4 after sigmoid
         return x
 
 
@@ -302,44 +300,10 @@ def generate_space_time_offsets(spatial_offsets, temporal_offsets):
 # Since the high resolution temporal lookup tables can we large we keep the feature size low
 # we use a nearest neighbor lookup for the temporal dimensions to expand the feature size at
 # inference time
-class SpaceTimeLookTable(nn.Module):
-    face_directions = [
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ]
-    corner_directions = [
-        (1, 1, 1),
-        (-1, -1, -1),
-        (1, -1, -1),
-        (-1, 1, 1),
-        (1, 1, -1),
-        (-1, -1, 1),
-        (1, -1, 1),
-        (-1, 1, -1),
-    ]
-    temporal_directions = [
-        (0, 0, 0, 1),
-        (0, 0, 0, -1),
-    ]  # For time only, space remains unchanged
+from geometry import face_directions, corner_directions, temporal_directions, exponential_temporal_directions
 
-    # Sampling corner neighbors in time direction exponentially
-    exponential_temporal_directions = [
-        (0, 0, 0, -64),
-        (0, 0, 0, -8),
-        (0, 0, 0, -4),
-        (0, 0, 0, -2),
-        (0, 0, 0, -1),
-        (0, 0, 0, 0),
-        (0, 0, 0, 1),
-        (0, 0, 0, 2),
-        (0, 0, 0, 4),
-        (0, 0, 0, 8),
-        (0, 0, 0, 64),
-    ]
+
+class SpaceTimeLookTable(nn.Module):
     basic_space_time_offsets = generate_space_time_offsets(face_directions + corner_directions, temporal_directions)
     exponential_time_offsets = generate_space_time_offsets(basic_space_time_offsets, exponential_temporal_directions)
 
@@ -355,8 +319,6 @@ class SpaceTimeLookTable(nn.Module):
         self.space_time_table_1 = LearnableLookupTable((16, 16, 16, 64), 64)  # 16x16x16x64x64
         self.space_time_table_2 = LearnableLookupTable((128, 128, 64, 16), 8)  # 128x128x64x16x8
 
-        # This table is low resolution soace and mostly carries high resolution
-        # time data
         # We sample all corner neighbors and we do it in time direction exponentialy [-64, -8, -4, -2, -1, 0, 1, 2, 4, 8, 64]
         # We sample 10 frames in each direction and we do it in 3 time steps
         self.time_focus_spacetime_table3 = LearnableLookupTable((4, 4, 4, 512 * 512), 8)
@@ -404,6 +366,8 @@ class SpaceTimeLookTable(nn.Module):
         self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
 
     def forward(self, pos, dir, t):
+        # Start by projecting with geo to look
+        pos = self.geom_proj_mlp(pos, dir, t)
         # Scale pos and t to the table sizes using the scale_indices method
         idx0 = self.table0.scale_indices(pos)
         idx1 = self.table1.scale_indices(pos)
@@ -577,18 +541,21 @@ class MoeSpaceTimeModel(nn.Module):
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
-        # Let's setup our classes
-        geo_class = SpaceTimeTransformerEncoder if use_attention_geo else SpacetimeGeometricProjectionMLP
+        geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4) if use_attention_geo else SpacetimeGeometricProjectionMLP
         render_class = TransformerEncoder if use_attention_render else SegGLUMLP
-        make_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
+
+        geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
+        table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
+        # Since table size is large we want this to be single fast layer
+        feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)
 
         num_geo_experts = 8
         self.geometric_layer = MoeLayer(
             experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts)]),
-            gate=make_gate(),
+            gate=geo_gate(),
             moe_args=MoeArgs(
                 num_experts=num_geo_experts,
-                num_experts_per_tok=1,
+                num_experts_per_tok=2,
                 num_default_experts=1,
             ),
         )
@@ -598,7 +565,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         self.table_moe = MoeLayer(
             experts=nn.ModuleList([LearnableLookupTable(table_size, table_feature_size) for _ in range(num_table_experts)]),
-            gate=make_gate(),
+            gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_table_experts,
                 num_experts_per_tok=num_active_tables,
@@ -610,7 +577,7 @@ class MoeSpaceTimeModel(nn.Module):
         render_feature_size = 8
         self.render_layer = MoeLayer(
             experts=nn.ModuleList([render_class(scene_feature_size, inner_dim=64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
-            gate=make_gate(),
+            gate=feature_gate(),
             moe_args=MoeArgs(
                 num_experts=num_render_experts,
                 num_experts_per_tok=2,
@@ -625,23 +592,27 @@ class MoeSpaceTimeModel(nn.Module):
         self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
         self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
 
-    def forward(self, pos, dir, t):
+    def forward(self, pos, origin, t):
         """
         Processes input position, direction, and time through geometric, table, and render layers to produce color and opacity.
         Concatenates position and time, sums geometric layer outputs, passes through table MoE and render layer, and finally predicts color and opacity.
         """
         x = torch.cat([pos, t.unsqueeze(-1)], dim=-1)  # Concatenate position and time
         all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
-        geo_features_sum = torch.sum(all_geometric, dim=-1)  # Sum geometric features
-        geo_features_sum = torch.clamp(geo_features_sum, 0, 1)  # Clamp between 0 and 1 to fix the domain shift above each invidual layer outputs 0-1
+        geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
 
-        all_table_values = self.table_moe(gate_inputs=geo_features_sum, inputs=geo_features_sum)  # Process summed geometric features through table MoE
+        # We want the gate feature for the lookup to be different the the index values since they are fixed incides they
+        # inherently have fixed 4D spacetime cubes. But we want our expert to decide which cube on a different geometric
+        # bias, so we split two streams
+        #
+        # (Generally expert selection on input data is ideal for traditional experts, but here our expert is a map not a function)
+        all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
         table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
-        render_features = self.render_layer(gate_inputs=geo_features_sum, inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
+        render_features = self.render_layer(gate_inputs=table_features, inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
 
-        color_input = torch.cat([render_features, dir, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
+        color_input = torch.cat([render_features, origin, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
         color = self.color_feature_layer(color_input)  # Predict color, Bx3
 
         return torch.cat([color, opacity], dim=-1)  # Return color and opacity, Bx4

@@ -70,18 +70,20 @@ class SphericalEmbedding(nn.Module):
         self.random_projection = nn.Parameter(torch.randn(3, projection_dim))  # 3 x (P*D)
 
     def forward(self, x):
-        assert x.shape[-1] == 3, "Input must be Bx3"
+        # Aligned on =
+        # fmt: off
+        assert x.shape[-1]  == 3, "Input must be Bx3"
         assert len(x.shape) == 2, "Input must be a 2D tensor"
-        # Expand input x to match depth dimension: B x D x 3
+
         x_expanded = x[:, None, :] - self.centers[None, :, :]  # B x D x 3
-        # Convert to spherical coordinates
-        rho = torch.sqrt(torch.sum(x_expanded**2, dim=-1, keepdim=True))  # B x D x 1
-        phi = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])  # B x D
-        theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))  # B x D
+
+        # fmt: off
+        rho   = torch.sqrt(torch.sum(x_expanded**2, dim=-1, keepdim=True)) # B x D x 1
+        phi   = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])      # B x D
+        theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))          # B x D
 
         spherical_coords = torch.stack([rho.squeeze(-1), phi, theta], dim=-1)  # B x D x 3
-        # Project spherical coordinates to higher dimensions using matrix multiplication
-        projected = torch.matmul(spherical_coords, self.random_projection)  # B x D x P
+        projected = torch.matmul(spherical_coords, self.random_projection)     # B x D x P
 
         return projected
 
@@ -96,8 +98,9 @@ class AngleEmbedding(nn.Module):
         self.random_projection = nn.Parameter(torch.randn(depth, input_dim * 2, projection_dim))  # Dx(2*I)xP
 
     def forward(self, x):
-        sin_x = torch.sin(x)  # BxI
-        cos_x = torch.cos(x)  # BxI
+        # fmt: off
+        sin_x       = torch.sin(x)  # BxI
+        cos_x       = torch.cos(x)  # BxI
         x_augmented = torch.cat([sin_x, cos_x], dim=-1)  # Bx(2*I)
         x_augmented = x_augmented.unsqueeze(1).expand(-1, self.depth, -1)  # BxDx(2*I)
         # Adjusted to perform depth-wise matrix multiplication
@@ -106,12 +109,14 @@ class AngleEmbedding(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, heads):
+    # https://arxiv.org/abs/2212.14034
+    def __init__(self, dim, heads, bias=False):
         super().__init__()
         self.attention = FlashGQAAttention(dim=dim, heads=heads, qk_dim=64, v_dim=8)  # Attention on D dimension
-        self.ff = nn.Sequential(nn.Linear(dim, dim * 2), GEGLU(), nn.Linear(dim * 2, dim))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        # fmt: off
+        self.ff        = nn.Sequential(nn.Linear(dim, dim * 2, bias=bias), GEGLU(), nn.Linear(dim * 2, dim, bias=bias))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
+        self.norm1     = nn.LayerNorm(dim)
+        self.norm2     = nn.LayerNorm(dim)
 
     def forward(self, x):
         x = x + self.attention(self.norm1(x))  # BxDxP after attention and residual connection
