@@ -205,6 +205,7 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
 
+# Projects a spherical point to a higher dimension embedding
 class SphericalEmbedding(nn.Module):
     def __init__(self, input_dim_=3, projection_dim=8):
         super(SphericalEmbedding, self).__init__()
@@ -219,12 +220,12 @@ class SphericalEmbedding(nn.Module):
         theta = torch.acos(x[:, :, 2] / rho)  # Bx1
 
         spherical_coords = torch.stack([rho, phi, theta], dim=-1)  # Bx3
-        # Project spherical coordinates to higher dimensions
-        projected = torch.einsum("bnd,df->bnf", spherical_coords, self.random_projection)  # Bx3x8
+        proj = torch.matmul(spherical_coords, self.random_projection)  # Bx8
 
-        return projected
+        return proj
 
 
+# Projects a time point to a higher dimension embedding
 class TimeEmbedding(nn.Module):
     def __init__(self):
         super(TimeEmbedding, self).__init__()
@@ -242,10 +243,9 @@ class TimeEmbedding(nn.Module):
 class SpacetimeGeometricProjectionMLP(nn.Module):
     def __init__(self, has_t=False):
         super(SpacetimeGeometricProjectionMLP, self).__init__()
-        self.has_t = has_t
         self.spherical_embedding = SphericalEmbedding(projection_dim=8)
         self.time_embedding = TimeEmbedding()
-        feature_input_dim = 8 * 8 + 2  # 8*8 for spherical embedding, + 4 for cos(t) and sin(t) + silu(cos(t)) + silu(sin(t))
+        feature_input_dim = 8 + 4  # 8 for spherical embedding, + 4 for time embed
 
         hidden_dim = 16
         self.feature_mlp = nn.Sequential(
@@ -260,13 +260,13 @@ class SpacetimeGeometricProjectionMLP(nn.Module):
         )
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        xyz, t = x[:, :3], x[:, 3:]
-        t_features = torch.cat((torch.cos(t), torch.sin(t)), dim=-1)  # Bx2
-        x = self.spherical_embedding(xyz)  # Bx8*8
-        x = torch.cat((x, t_features), dim=-1)  # Bx(8*8+2)
-        x = self.feature_mlp(x)  # Bx4
-        x = self.sigmoid(x)  # Bx4
+    def forward(self, x, t=None):
+        spherical_embedded = self.spherical_embedding(x)  # Bx8*8
+        time_embedded = self.time_embedding(t)  # Bx4
+        x = torch.cat([spherical_embedded, time_embedded], dim=-1)  # Bx(8*8+4)
+
+        x = self.feature_mlp(x)  # Bx4 after MLP
+        x = self.sigmoid(x)  # Bx4 after sigmoid
         return x
 
 
@@ -501,16 +501,22 @@ class SpaceTimeLookTable(nn.Module):
 class SegGLUMLP(nn.Module):
     def __init__(self, input_dim, inner_dim, output_dim):
         super(SegGLUMLP, self).__init__()
-
-        self.seglu_embed = lambda x, y: torch.cat((torch.sin(x), torch.sin(F.silu(x)), torch.cos(y), torch.cos(F.silu(y))), dim=-1)  # * 4 the size
+        self.cos_bias = nn.Parameter(torch.zeros(1))
+        self.sin_bias = nn.Parameter(torch.zeros(1))
+        self.seglu_embed = lambda x: torch.cat(
+            (torch.sin(x + self.sin_bias), torch.sin(F.silu(x + self.sin_bias)), torch.cos(x + self.cos_bias), torch.cos(F.silu(x + self.cos_bias))), dim=-1
+        )  # * 4 the size
         self.seglu = lambda x: torch.cat([x, F.silu(x)], dim=-1)
 
         self.mlp = nn.Sequential(
-            RMSNorm(inner_dim),
             self.seglu_embed,
+            RMSNorm(input_dim * 4),
             nn.Linear(input_dim * 4, inner_dim),
             self.seglu(),
-            RMSNorm(inner_dim),
+            RMSNorm(input_dim * 4),
+            nn.Linear(inner_dim * 2, inner_dim),
+            self.seglu(),
+            RMSNorm(inner_dim * 2),
             nn.Linear(inner_dim * 2, output_dim),
         )
 
