@@ -225,34 +225,48 @@ class SphericalEmbedding(nn.Module):
         return projected
 
 
-class GeometricProjectionMLP(nn.Module):
+class TimeEmbedding(nn.Module):
+    def __init__(self):
+        super(TimeEmbedding, self).__init__()
+        self.bias1 = nn.Parameter(torch.zeros(1))
+        self.bias2 = nn.Parameter(torch.zeros(1))
 
+    def forward(self, t):
+        cos_t = torch.cos(t + self.bias1)  # Bx1
+        sin_t = torch.sin(t + self.bias2)  # Bx1
+        silu_sin_t = torch.nn.functional.silu(sin_t)  # Bx1
+        silu_cos_t = torch.nn.functional.silu(cos_t)  # Bx1
+        return torch.cat([cos_t, sin_t, silu_cos_t, silu_sin_t], dim=-1)  # Bx4
+
+
+class SpacetimeGeometricProjectionMLP(nn.Module):
     def __init__(self, has_t=False):
-        super(GeometricProjectionMLP, self).__init__()
+        super(SpacetimeGeometricProjectionMLP, self).__init__()
         self.has_t = has_t
         self.spherical_embedding = SphericalEmbedding(projection_dim=8)
-        feature_input_dim = 8 * 8 + (2 if has_t else 0)  # 8*8 for spherical embedding, +2 for cos(t) and sin(t)
+        self.time_embedding = TimeEmbedding()
+        feature_input_dim = 8 * 8 + 2  # 8*8 for spherical embedding, + 4 for cos(t) and sin(t) + silu(cos(t)) + silu(sin(t))
 
         hidden_dim = 16
         self.feature_mlp = nn.Sequential(
-            nn.Linear(feature_input_dim, hidden_dim),
+            RMSNorm(feature_input_dim),
+            nn.Linear(feature_input_dim, hidden_dim * 2),
             GEGLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            RMSNorm(feature_input_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            GEGLU(),
             RMSNorm(hidden_dim),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, 4),
         )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        if self.has_t:
-            xyz, t = x[:, :3], x[:, 3:]
-            t_features = torch.cat((torch.cos(t), torch.sin(t)), dim=-1)  # Bx2
-            x = self.spherical_embedding(xyz)  # Bx8*8
-            x = torch.cat((x, t_features), dim=-1)  # Bx(8*8+2)
-        else:
-            x = self.spherical_embedding(x)  # Bx8*8
-        x = self.feature_mlp(x)
-        x = self.sigmoid(x)
+        xyz, t = x[:, :3], x[:, 3:]
+        t_features = torch.cat((torch.cos(t), torch.sin(t)), dim=-1)  # Bx2
+        x = self.spherical_embedding(xyz)  # Bx8*8
+        x = torch.cat((x, t_features), dim=-1)  # Bx(8*8+2)
+        x = self.feature_mlp(x)  # Bx4
+        x = self.sigmoid(x)  # Bx4
         return x
 
 
@@ -352,7 +366,7 @@ class SpaceTimeLookTable(nn.Module):
         if use_attention:
             self.geom_proj_mlp = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
         else:
-            self.geom_proj_mlp = GeometricProjectionMLP(has_t=True)
+            self.geom_proj_mlp = SpacetimeGeometricProjectionMLP(has_t=True)
 
         # Linear layer to downsize feature dimension and append viewing direction
         # The input dimension calculation is broken down as follows:
@@ -374,7 +388,7 @@ class SpaceTimeLookTable(nn.Module):
         )
 
         if use_attention:
-            self.value_mlp = SpaceTimeEncoder(
+            self.value_mlp = SpaceTimeTransformerEncoder(
                 input_dim=total_feature_size, output_dim=inner_dim, embedding_depth=8, projection_dim=inner_dim, heads=8, model_depth=1
             )
         else:
@@ -382,7 +396,8 @@ class SpaceTimeLookTable(nn.Module):
                 RMSNorm(total_feature_size),
                 nn.Linear(total_feature_size, total_feature_size * 2, bias=False),
                 GEGLU(),
-                nn.Linear(total_feature_size * 2, inner_dim, bias=False),
+                RMSNorm(total_feature_size * 2),
+                nn.Linear(total_feature_size, inner_dim, bias=False),
             )
 
         # Final projection to color and alpha
@@ -557,7 +572,7 @@ class MoeSpaceTimeModel(nn.Module):
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
         # Let's setup our classes
-        geo_class = SpaceTimeTransformerEncoder if use_attention_geo else GeometricProjectionMLP
+        geo_class = SpaceTimeTransformerEncoder if use_attention_geo else SpacetimeGeometricProjectionMLP
         render_class = TransformerEncoder if use_attention_render else SegGLUMLP
         make_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
 
