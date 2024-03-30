@@ -46,7 +46,7 @@ Currently the code is not running as a did a major overhaul to add all the featu
 #### Style Controls
 
 - [x] CLIP based pixel style loss
-- [x] CLIP based geometry style loss on depth maps
+- [x] CLIP based geometry style loss on depth maps[1]
 
 #### Training Speedups
 
@@ -55,6 +55,7 @@ Currently the code is not running as a did a major overhaul to add all the featu
 - [x] Use fast lookup tables inspired by nvidia Instant NGP
 - [] (TODO): Use actual CUDA kernels from instant-NGP(Although these won't be spacetime compatible)(The torch tables may be fast enough)
 
+[1] https://hyblue.github.io/geo-srf/
 ### Logs
 
 Logs are currently going to weights and biases logs here:
