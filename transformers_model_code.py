@@ -60,30 +60,28 @@ class FlashGQAAttention(nn.Module):
 
 
 class SphericalEmbedding(nn.Module):
-    def __init__(self, projection_dim=8, depth_dim=8):
+    def __init__(self, dim=8, depth=8):
         super(SphericalEmbedding, self).__init__()
-        self.projection_dim = projection_dim
-        self.depth_dim = depth_dim
+        self.projection_dim = dim
+        self.depth_dim = depth
         # Initialize a center point for each projection dimension, resulting in D x 3
-        self.centers = nn.Parameter(torch.randn(depth_dim, 3))  # D x 3
-        # Random projection matrix from 3D spherical coordinates to P dimensions for each depth dimension, resulting in D x 3 x P
-        self.random_projection = nn.Parameter(torch.randn(3, projection_dim))  # 3 x (P*D)
+        self.centers = nn.Parameter(torch.randn(depth, 3))  # D x 3
+        # Corrected the shape of the random projection matrix to match the expected output dimensions
+        self.random_projection = nn.Parameter(torch.randn(depth, 3, dim))  # D x 3 x P
 
     def forward(self, x):
-        # Aligned on =
-        # fmt: off
-        assert x.shape[-1]  == 3, "Input must be Bx3"
+        assert x.shape[-1] == 3, "Input must be Bx3"
         assert len(x.shape) == 2, "Input must be a 2D tensor"
 
         x_expanded = x[:, None, :] - self.centers[None, :, :]  # B x D x 3
 
-        # fmt: off
-        rho   = torch.sqrt(torch.sum(x_expanded**2, dim=-1, keepdim=True)) # B x D x 1
-        phi   = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])      # B x D
-        theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))          # B x D
+        rho = torch.sqrt(torch.sum(x_expanded**2, dim=-1, keepdim=True))  # B x D x 1
+        phi = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])  # B x D
+        theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))  # B x D
 
         spherical_coords = torch.stack([rho.squeeze(-1), phi, theta], dim=-1)  # B x D x 3
-        projected = torch.matmul(spherical_coords, self.random_projection)     # B x D x P
+        # Corrected matrix multiplication to account for depth dimension in random_projection
+        projected = torch.einsum("bdi,dij->bdj", spherical_coords, self.random_projection)  # B x D x P
 
         return projected
 
@@ -124,24 +122,35 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class SpaceTimeEmbedding(nn.Module):
+    def __init__(self, projection_dim=8, depth=8):
+        super(SpaceTimeEmbedding, self).__init__()
+
+        spherical_embedding_dim = depth - 1
+        time_embedding_dim = 1
+        self.spherical_embedding = SphericalEmbedding(input_dim=3, dim=projection_dim, depth=spherical_embedding_dim)
+        self.angle_embedding = AngleEmbedding(input_dim=1, projection_dim=projection_dim, depth=time_embedding_dim)
+
+    def forward(self, xyzt):
+        xyz, t = torch.split(xyzt, [3, 1], dim=-1)
+        spherical_embedded = self.spherical_embedding(xyz)
+        angle_embedded = self.angle_embedding(t)
+        return torch.cat([spherical_embedded, angle_embedded], dim=-2)
+
+
 class SpaceTimeTransformerEncoder(nn.Module):
     def __init__(self, output_dim, projection_dim=8, heads=8, model_depth=1):
         super().__init__()
         embedding_dim = 8
-        spherical_embedding_dim = embedding_dim - 1
-        time_embedding_dim = 1
         p = projection_dim
         # fmt: off
-        self.spherical_embedding    = SphericalEmbedding(input_dim=3, projection_dim=p, depth=spherical_embedding_dim)    # BxDxP
-        self.angle_embedding        = AngleEmbedding(    input_dim=1, projection_dim=p, depth=time_embedding_dim)  # BxDxP
+        self.embedding              = SpaceTimeEmbedding(projection_dim=projection_dim, depth=embedding_dim)
         self.transformer_blocks     = nn.ModuleList([TransformerBlock(projection_dim, heads) for _ in range(model_depth)])
         self.final_projection       = nn.Linear(projection_dim * embedding_dim * projection_dim, output_dim)
 
     def forward(self, x):  # x = BxI
         # fmt: off
-        spherical_embedded = self.spherical_embedding(x)  
-        angle_embedded     = self.angle_embedding(x)      
-        x                  = torch.cat([spherical_embedded, angle_embedded], dim=-2)  
+        x = self.embedding(x)
         
         for block in self.transformer_blocks:
             x = block(x)  
@@ -150,7 +159,6 @@ class SpaceTimeTransformerEncoder(nn.Module):
         x = self.final_projection(x)  
         
         return x  
-        # BxO
 
 
 # A standard transformer that embeds the input and evals layers and projects to final size
@@ -197,7 +205,7 @@ def test_tiny_spherical_transformer():
 
 # Spherical embedding test should check that we go from BxInput Dim size to BxP size
 def test_spherical_embedding():
-    model = SphericalEmbedding(projection_dim=8)
+    model = SphericalEmbedding(dim=8)
     x = torch.randn(10, 3)  # Bx3
     out = model(x)
     assert out.shape == (10, 8)  # Updated to match the corrected output shape
@@ -207,3 +215,4 @@ def test_spherical_embedding():
 if __name__ == "__main__":
     test_spherical_embedding()
     test_tiny_spherical_transformer()
+    test_space_time_encoder()

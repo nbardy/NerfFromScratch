@@ -240,11 +240,23 @@ class TimeEmbedding(nn.Module):
         return torch.cat([cos_t, sin_t, silu_cos_t, silu_sin_t], dim=-1)  # Bx4
 
 
+class SpaceTimeEmbedding(nn.Module):
+    def __init__(self):
+        super(SpaceTimeEmbedding, self).__init__()
+        self.spherical_embedding = SphericalEmbedding(projection_dim=8)
+        self.time_embedding = TimeEmbedding()
+
+    def forward(self, xyzt):
+        xyz, t = torch.split(xyzt, [3, 1], dim=-1)
+        spherical_embedded = self.spherical_embedding(xyz)
+        time_embedded = self.time_embedding(t)
+        return torch.cat([spherical_embedded, time_embedded], dim=-1)
+
+
 class SpacetimeGeometricProjectionMLP(nn.Module):
     def __init__(self, inner_bias=False):
         super(SpacetimeGeometricProjectionMLP, self).__init__()
-        self.spherical_embedding = SphericalEmbedding(projection_dim=8)
-        self.time_embedding = TimeEmbedding()
+        self.embedding = SpaceTimeEmbedding()
         feature_input_dim = 8 + 4  # 8 for spherical embedding, + 4 for time embed
 
         hidden_dim = 16
@@ -260,11 +272,8 @@ class SpacetimeGeometricProjectionMLP(nn.Module):
         )
 
     def forward(self, x, t=None):
-        spherical_embedded = self.spherical_embedding(x)  # Bx8*8
-        time_embedded = self.time_embedding(t)  # Bx4
-        x = torch.cat([spherical_embedded, time_embedded], dim=-1)  # Bx(8*8+4)
-
-        x = self.feature_mlp(x)  # Bx4 after MLP
+        x = self.embedding(x)
+        x = self.feature_mlp(x)
         return x
 
 
