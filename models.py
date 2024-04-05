@@ -387,10 +387,17 @@ class MoeSpaceTimeModel(nn.Module):
         table_size = (64, 64, 64, 128)
         table_feature_size = 16
 
+        num_active_tables = 22 + 2
+        scene_feature_size = num_active_tables * table_feature_size
+
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
         geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(depth=2, inner_bias=False)
-        render_class = lambda: TransformerEncoder(model_depth=2) if use_attention_render else SegGLUMLP(depth=2)
+        render_class = lambda: (
+            TransformerEncoder(model_depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
+            if use_attention_render
+            else SegGLUMLP(depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
+        )
         table_class = lambda: LearnableLookupTable(table_size, table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
@@ -409,11 +416,8 @@ class MoeSpaceTimeModel(nn.Module):
             ),
         )
 
-        num_active_tables = 22 + 2
-        scene_feature_size = num_active_tables * table_feature_size
-
         self.table_moe = MoeLayer(
-            experts=nn.ModuleList([table_class for _ in range(num_table_experts)]),
+            experts=nn.ModuleList([table_class() for _ in range(num_table_experts)]),
             gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_table_experts,
