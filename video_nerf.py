@@ -540,9 +540,13 @@ def train_video(
     assert max_frames is not None
     assert args is not None
 
+    ## Load Assets
     wandb.init(project="3D_nerf")
 
-    camera_position = LearnableCameraPosition(n_frames=n_frames)
+    device = get_default_device()
+    video_frames = load_video(video_path, max_frames=max_frames)
+
+    camera_position = LearnableCameraPosition(n_frames=len(video_frames))
     scene_function = get_model(args.model)
 
     optimizer = torch.optim.Adam(
@@ -555,8 +559,6 @@ def train_video(
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    device = get_default_device()
-    video_frames = load_video(video_path, max_frames=max_frames)
 
     size = video_frames[0].shape
     size = [size[1], size[2]]
@@ -596,7 +598,8 @@ def train_video(
             batch_output.append(sampled_colors)
             batch_depth.append(sampled_depth_estimates)
 
-            t = video_frames.index(frame) / max_frames
+            # Turn index into scaled t va
+            t = frame_index / max_frames
             t = torch.ones(n_points, 1) * t
             t = t.to(device)
             batch_t.append(t)
