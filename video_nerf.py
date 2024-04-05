@@ -2,6 +2,7 @@
 #
 # Impliments a pipeline to train a NERF from a mp4 video file with unknown camera parameters
 # and optionally to train a style LORA on top of the nerf with different geometry
+from einops import repeat, rearrange
 import torch
 import torch.nn as nn
 import wandb
@@ -225,6 +226,12 @@ def transmittance(alphas):
 
 
 def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_samples, args=None):
+    # all sizes pretty print debug
+    print(" ,.-* Input sizes *.-,")
+    print("ray_origins", ray_origins.shape)
+    print("ray_directions", ray_directions.shape)
+    print("times", times.shape)
+
     device = ray_origins.device
     nb_bins = num_samples
     T = args.entropy_threshold if args.enable_entropy_loss else 0.1
@@ -250,16 +257,34 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
         ),
         dim=-1,
     )  # [B, nb_bins]
+
+    # print sizes
+    print(" ,.-*='` Ray Direction sizes `'=*-., ")
+    print("ray_directions", ray_directions.shape)
+    print("ray_origins", ray_origins.shape)
+    print("times", times.shape)
+
     # Compute 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
     # ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
-    ray_origins = ray_origins.expand(nb_bins, ray_origins.shape[0], 3).transpose(0, 1)
+
+    ray_origins = repeat(ray_origins, "b c -> b nb_bins c", nb_bins=nb_bins)  # Bxnb_binsx3
+    times = repeat(times, "b 1 -> b nb_bins", nb_bins=nb_bins)  # Bxnb_bins
+
+    # Use einops.rearrange for reshaping operations
+    flat_x = rearrange(x, "b nb_bins c -> (b nb_bins) c")  # B*nb_binsx3
+    flat_times = rearrange(times, "b nb_bins -> (b nb_bins) 1")  # B*nb_binsx1
+    flat_origin = rearrange(ray_origins, "b nb_bins c -> (b nb_bins) c")  # B*nb_binsx3
 
     # Query NeRF model for colors and densities
-    colors, sigma = nerf_model(point=x.reshape(-1, 3), time=times, origin=ray_directions.reshape(-1, 3))
+    colors, sigma = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
     colors = colors.reshape(x.shape)
     sigma = sigma.reshape(x.shape[:-1])
+
+    print(" ,.-* NeRF model output sizes *.-,")
+    print("colors", colors.shape)
+    print("sigma", sigma.shape)
 
     # Compute alpha values and weights for color accumulation
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]

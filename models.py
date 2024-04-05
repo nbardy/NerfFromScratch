@@ -211,15 +211,17 @@ class SphericalEmbedding(nn.Module):
         super(SphericalEmbedding, self).__init__()
         self.projection_dim = projection_dim
         self.random_projection = nn.Parameter(torch.randn(3, projection_dim))  # 3x8
+        self.center = nn.Parameter(torch.zeros(1, 3))  # Learnable center of the spherical transform
 
     def forward(self, x):
         # x: Bx3
+        x_centered = x - self.center  # Center the input coordinates
         # Convert to spherical coordinates
-        rho = torch.sqrt(torch.sum(x**2, dim=-1, keepdim=True))  # Bx1
-        phi = torch.atan2(x[:, :, 1], x[:, :, 0])  # Bx1
-        theta = torch.acos(x[:, :, 2] / rho)  # Bx1
+        rho = torch.sqrt(torch.sum(x_centered**2, dim=-1, keepdim=True))  # Bx1
+        phi = torch.atan2(x_centered[:, 1], x_centered[:, 0]).unsqueeze(-1)  # Bx1
+        theta = torch.acos(x_centered[:, 2] / (rho.squeeze(-1) + 1e-6)).unsqueeze(-1)  # Bx1 to avoid division by zero
 
-        spherical_coords = torch.stack([rho, phi, theta], dim=-1)  # Bx3
+        spherical_coords = torch.cat([rho, phi, theta], dim=-1)  # Bx3
         proj = torch.matmul(spherical_coords, self.random_projection)  # Bx8
 
         return proj
@@ -231,6 +233,8 @@ class TimeEmbedding(nn.Module):
         super(TimeEmbedding, self).__init__()
         self.bias1 = nn.Parameter(torch.zeros(1))
         self.bias2 = nn.Parameter(torch.zeros(1))
+
+        self.size = 4
 
     def forward(self, t):
         cos_t = torch.cos(t + self.bias1)  # Bx1
@@ -250,7 +254,11 @@ class SpaceTimeEmbedding(nn.Module):
         xyz, t = torch.split(xyzt, [3, 1], dim=-1)
         spherical_embedded = self.spherical_embedding(xyz)
         time_embedded = self.time_embedding(t)
-        return torch.cat([spherical_embedded, time_embedded], dim=-1)
+        # Reshape embeddings to ensure matching dimensions for concatenation
+        spherical_embedded_reshaped = spherical_embedded.view(-1, 8)  # Reshape to ensure size is Bx8
+        time_embedded_reshaped = time_embedded.view(-1, 4)  # Reshape to ensure size is Bx4
+        embedded = torch.cat([spherical_embedded_reshaped, time_embedded_reshaped], dim=-1)  # Concatenate along feature dimension to get Bx12
+        return embedded
 
 
 class SpacetimeGeometricMLP(nn.Module):
@@ -270,9 +278,16 @@ class SpacetimeGeometricMLP(nn.Module):
                 layers.append(GEGLU())
 
         self.feature_mlp = nn.Sequential(*layers)
-        self.final_layer = nn.Linear(hidden_dim * 2 if depth > 0 or inner_activation else feature_input_dim, output_dim)
+        self.final_size = hidden_dim if inner_activation else hidden_dim * 2
+        print("final_size", self.final_size, "output_dim", output_dim)
+        self.final_layer = nn.Linear(self.final_size, output_dim)
+
+    def debug_forward(self, x):
+        print("final_size", self.final_size)
+        print("x", x.shape)
 
     def forward(self, x):
+        self.debug_forward(x)
         x = self.embedding(x)
         x = self.feature_mlp(x)
         x = self.final_layer(x)
@@ -326,16 +341,21 @@ class SegGLUMLP(nn.Module):
                     dim=-1,
                 )  # Output size: B x (input_dim * 4)
 
-        self.seglu_embed = SegluEmbed(self.cos_bias, self.sin_bias)
-
-        layers = [self.seglu_embed, nn.Linear(input_dim * 4, inner_dim), GEGLU()]
+        layers = []
         for _ in range(depth):
-            layers.extend([RMSNorm(inner_dim * 2), nn.Linear(inner_dim * 2, inner_dim), GEGLU()])
-        layers.append(nn.Linear(inner_dim * 2, output_dim))
+            layers.extend([GEGLU(), RMSNorm(inner_dim), nn.Linear(inner_dim, inner_dim * 2)])
+
+        self.seglu_embed = SegluEmbed(self.cos_bias, self.sin_bias)
+        self.embed = nn.Linear(input_dim * 4, inner_dim * 2)
         self.mlp = nn.Sequential(*layers)
+        self.final_layer = nn.Linear(inner_dim * 2, output_dim)
 
     def forward(self, x):
-        return self.mlp(x)
+        x = self.seglu_embed(x)
+        x = self.embed(x)
+        x = self.mlp(x)
+        x = self.final_layer(x)
+        return x
 
 
 @dataclasses.dataclass
@@ -361,6 +381,7 @@ class MoeLayer(nn.Module):
         weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
+        # results = []
 
         # Process default experts
         if self.args.num_default_experts > 0:
@@ -387,58 +408,69 @@ class MoeSpaceTimeModel(nn.Module):
         self.input_dim = 4
 
         # Expert counts for tables
-        num_table_experts = 6
         table_size = (64, 64, 64, 128)
         table_feature_size = 16
 
-        num_active_tables = 22 + 2
+        num_geo_experts_total = 8
+        num_geo_default_experts = 1
+        num_geo_experts_chosen = 1
+
+        num_total_tables = 40
+        num_table_default_experts = 2
+        num_table_experts_chosen = 2
+
+        num_render_experts_total = 16
+        num_render_default_experts = 1
+        num_render_experts_chosen = 1
+
+        num_active_tables = num_geo_experts_chosen + num_table_experts_chosen
         scene_feature_size = num_active_tables * table_feature_size
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
-        geo_class = lambda: (SpaceTimeTransformerEncoder(output_dim=4, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP())
+        geo_class = lambda: (SpaceTimeTransformerEncoder(output_dim=8, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=8))
         render_class = lambda: (
-            TransformerEncoder(model_depth=8, input_dim=scene_feature_size, output_dim=render_feature_size)
+            TransformerEncoder(model_depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
             if use_attention_render
             else SegGLUMLP(depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
         )
         table_class = lambda: LearnableLookupTable(table_size, table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
-        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts, inner_activation=True, inner_bias=True)
-        table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
+
+        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_chosen, inner_activation=True, inner_bias=True)
+        table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts_chosen)
         feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
-        num_geo_experts = 8
         self.geometric_layer = MoeLayer(
-            experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts)]),
+            experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts_total)]),
             gate=geo_gate(),
             moe_args=MoeArgs(
-                num_experts=num_geo_experts,
-                num_experts_per_tok=2,
-                num_default_experts=1,
+                num_experts=num_geo_experts_total,
+                num_experts_per_tok=num_geo_experts_chosen,
+                num_default_experts=num_geo_default_experts,
             ),
         )
 
         self.table_moe = MoeLayer(
-            experts=nn.ModuleList([table_class() for _ in range(num_table_experts)]),
+            experts=nn.ModuleList([table_class() for _ in range(num_total_tables)]),
             gate=table_gate(),
             moe_args=MoeArgs(
-                num_experts=num_table_experts,
-                num_experts_per_tok=num_active_tables,
-                num_default_experts=2,
+                num_experts=num_active_tables,
+                num_experts_per_tok=num_table_experts_chosen,
+                num_default_experts=num_table_default_experts,
             ),
         )
 
         num_render_experts = 8
         render_feature_size = 8
         self.render_layer = MoeLayer(
-            experts=nn.ModuleList([render_class() for _ in range(num_render_experts)]),
+            experts=nn.ModuleList([render_class() for _ in range(num_render_experts_total)]),
             gate=feature_gate(),
             moe_args=MoeArgs(
-                num_experts=num_render_experts,
-                num_experts_per_tok=2,
-                num_default_experts=1,
+                num_experts=num_render_experts_total,
+                num_experts_per_tok=num_render_experts_chosen,
+                num_default_experts=num_render_default_experts,
             ),
         )
 
@@ -459,9 +491,12 @@ class MoeSpaceTimeModel(nn.Module):
         # Debug shapes
         # Concatenate position and time along the feature dimension
         print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
-        x = torch.cat([pos, t], dim=-1)  # Bx(C+1)
+        x = torch.cat([pos, t], dim=1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
+
+        print("sizes: (geo_features_1, geo_features_2)", geo_features_1.shape, geo_features_2.shape)
+        print("all_geometric", all_geometric.shape)
 
         # We want the data selection to be based on a different geometry than the table index
         # So we gate, Gating on the index values would be too limiting since the values from
@@ -473,10 +508,14 @@ class MoeSpaceTimeModel(nn.Module):
         #  our expert is a table not a function so we need to gate on a non-index value to allow
         # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
+        print("all_table_values", all_table_values.shape)
         table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
+        print("table_features", table_features.shape)
         render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
+        print("render_features", render_features.shape)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
+        print("opacity", opacity.shape)
 
         color_input = torch.cat([render_features, origin, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
         color = self.color_feature_layer(color_input)  # Predict color, Bx3
