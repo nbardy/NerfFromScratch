@@ -253,23 +253,25 @@ class SpaceTimeEmbedding(nn.Module):
         return torch.cat([spherical_embedded, time_embedded], dim=-1)
 
 
-class SpacetimeGeometricProjectionMLP(nn.Module):
-    def __init__(self, inner_bias=False):
-        super(SpacetimeGeometricProjectionMLP, self).__init__()
+class SpacetimeGeometricMLP(nn.Module):
+    # dpeth is how many hidden layers
+    def __init__(self, inner_bias=False, hidden_dim=16, depth=1):
+        super(SpacetimeGeometricMLP, self).__init__()
         self.embedding = SpaceTimeEmbedding()
         feature_input_dim = 8 + 4  # 8 for spherical embedding, + 4 for time embed
 
-        hidden_dim = 16
-        self.feature_mlp = nn.Sequential(
-            RMSNorm(feature_input_dim),
-            nn.Linear(feature_input_dim, hidden_dim * 2, bias=inner_bias),
-            GEGLU(),
-            RMSNorm(feature_input_dim),
-            nn.Linear(hidden_dim, hidden_dim * 2, bias=inner_bias),
-            GEGLU(),
-            RMSNorm(hidden_dim),
-            nn.Linear(hidden_dim, 4),
+        layers = [nn.Linear(feature_input_dim, hidden_dim * 2, bias=inner_bias), GEGLU()]
+
+        for _ in range(depth):
+            layers.extend([RMSNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2, bias=inner_bias), GEGLU()])
+
+        layers.extend(
+            [
+                nn.Linear(hidden_dim * 2, 4),
+            ]
         )
+
+        self.feature_mlp = nn.Sequential(*layers)
 
     def forward(self, x, t=None):
         x = self.embedding(x)
@@ -305,7 +307,7 @@ class SpacetimeGeometricProjectionMLP(nn.Module):
 # gated activation units, silu does that well. We use a simple sin/cos
 # embedding to fix standard MLP bias with high frequencies.
 class SegGLUMLP(nn.Module):
-    def __init__(self, input_dim, inner_dim, output_dim):
+    def __init__(self, input_dim, inner_dim, output_dim, depth=1):
         super(SegGLUMLP, self).__init__()
         self.cos_bias = nn.Parameter(torch.zeros(1))
         self.sin_bias = nn.Parameter(torch.zeros(1))
@@ -323,23 +325,13 @@ class SegGLUMLP(nn.Module):
                     dim=-1,
                 )  # Output size: B x (input_dim * 4)
 
-        # Define seglu as a module
-        class Seglu(nn.Module):
-            def forward(self, x):
-                return torch.cat([x, F.silu(x)], dim=-1)  # Output size: B x (input_dim * 2)
-
         self.seglu_embed = SegluEmbed(self.cos_bias, self.sin_bias)
-        self.seglu = Seglu()
 
         self.mlp = nn.Sequential(
             self.seglu_embed,
-            RMSNorm(input_dim * 4),
             nn.Linear(input_dim * 4, inner_dim),
-            self.seglu,
-            RMSNorm(inner_dim * 2),
-            nn.Linear(inner_dim * 2, inner_dim),
-            self.seglu,
-            RMSNorm(inner_dim * 2),
+            GEGLU(),
+            *[RMSNorm(inner_dim * 2), nn.Linear(inner_dim * 2, inner_dim), GEGLU() for _ in range(depth)],
             nn.Linear(inner_dim * 2, output_dim),
         )
 
@@ -363,7 +355,9 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.args = moe_args
 
-    def forward(self, gate_inputs: torch.Tensor, inputs: torch.Tensor):
+    def forward(self, inputs: torch.Tensor, gate_inputs: torch.Tensor = None):
+        if gate_inputs is None:
+            gate_inputs = inputs
         gate_logits = self.gate(gate_inputs)
         weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
@@ -400,13 +394,14 @@ class MoeSpaceTimeModel(nn.Module):
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
-        geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4) if use_attention_geo else SpacetimeGeometricProjectionMLP
-        render_class = TransformerEncoder if use_attention_render else SegGLUMLP
+        geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4, depth=2) if use_attention_geo else SpacetimeGeometricMLP(depth=2)
+        render_class = TransformerEncoder(depth=2) if use_attention_render else SegGLUMLP(depth=2)
+        table_class = lambda: LearnableLookupTable(table_size, table_feature_size)
 
-        geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
+        # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
+        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=1, output_dim=num_geo_experts)
         table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
-        # Since table size is large we want this to be single fast layer
-        feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)
+        feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False) # Since table size is large we want this to be single fast layer
 
         num_geo_experts = 8
         self.geometric_layer = MoeLayer(
@@ -423,7 +418,7 @@ class MoeSpaceTimeModel(nn.Module):
         scene_feature_size = num_active_tables * table_feature_size
 
         self.table_moe = MoeLayer(
-            experts=nn.ModuleList([LearnableLookupTable(table_size, table_feature_size) for _ in range(num_table_experts)]),
+            experts=nn.ModuleList([table_class for _ in range(num_table_experts)]),
             gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_table_experts,
@@ -457,18 +452,25 @@ class MoeSpaceTimeModel(nn.Module):
         Concatenates position and time, sums geometric layer outputs, passes through table MoE and render layer, and finally predicts color and opacity.
         """
         pos, origin, t = point, origin, time
-        x = torch.cat([pos, t.unsqueeze(-1)], dim=-1)  # Concatenate position and time
+        from einops import rearrange
+        # Debug shapes
+        print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
+        x = rearrange([pos, t], "b c -> b (c c1)")  # Concatenate position and time, resulting in a tensor of shape Bx4
         all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
 
-        # We want the gate feature for the lookup to be different the the index values since they are fixed incides they
-        # inherently have fixed 4D spacetime cubes. But we want our expert to decide which cube on a different geometric
-        # bias, so we split two streams
+        # We want the data selection to be based on a different geometry than the table index
+        # So we gate, Gating on the index values would be too limiting since the values from
+        # the geometric projection are indices not features
         #
-        # (Generally expert selection on input data is ideal for traditional experts, but here our expert is a map not a function)
+        # The second projection should be free to project features for the expert
+        #
+        # (Generally expert selection on input data is ideal for traditional experts, but here 
+        #  our expert is a table not a function so we need to gate on a non-index value to allow
+        # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
         table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
-        render_features = self.render_layer(gate_inputs=table_features, inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
+        render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
 
@@ -554,7 +556,7 @@ class SpaceTimeLookTable(nn.Module):
         if use_attention:
             self.geom_proj_mlp = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
         else:
-            self.geom_proj_mlp = SpacetimeGeometricProjectionMLP(has_t=True)
+            self.geom_proj_mlp = SpacetimeGeometricMLP(has_t=True)
 
         # Linear layer to downsize feature dimension and append viewing direction
         # The input dimension calculation is broken down as follows:
