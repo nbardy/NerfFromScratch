@@ -254,19 +254,23 @@ class SpaceTimeEmbedding(nn.Module):
 
 
 class SpacetimeGeometricMLP(nn.Module):
-    # dpeth is how many hidden layers
-    def __init__(self, inner_bias=False, hidden_dim=16, depth=1, output_dim=4):
+    # depth is how many hidden layers
+    def __init__(self, inner_bias=False, hidden_dim=16, depth=0, output_dim=4, inner_activation=False):
         super(SpacetimeGeometricMLP, self).__init__()
         self.embedding = SpaceTimeEmbedding()
-        feature_input_dim = 8 + 4  # 8 for spherical embedding, + 4 for time embed
+        feature_input_dim = 12  # 8 for spherical embedding + 4 for time embed
 
-        layers = [nn.Linear(feature_input_dim, hidden_dim * 2, bias=inner_bias), GEGLU()]
+        layers = [nn.Linear(feature_input_dim, hidden_dim * 2, bias=inner_bias)]
+        if inner_activation:
+            layers.append(GEGLU())
 
         for _ in range(depth):
-            layers.extend([RMSNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2, bias=inner_bias), GEGLU()])
+            layers.extend([RMSNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2, bias=inner_bias)])
+            if inner_activation:
+                layers.append(GEGLU())
 
         self.feature_mlp = nn.Sequential(*layers)
-        self.final_layer = nn.Linear(hidden_dim * 2, output_dim)
+        self.final_layer = nn.Linear(hidden_dim * 2 if depth > 0 or inner_activation else feature_input_dim, output_dim)
 
     def forward(self, x):
         x = self.embedding(x)
@@ -392,7 +396,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
-        geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(depth=2, inner_bias=False)
+        geo_class = lambda: (SpaceTimeTransformerEncoder(output_dim=4, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP())
         render_class = lambda: (
             TransformerEncoder(model_depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
             if use_attention_render
@@ -401,7 +405,7 @@ class MoeSpaceTimeModel(nn.Module):
         table_class = lambda: LearnableLookupTable(table_size, table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
-        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=1, output_dim=num_geo_experts)
+        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts, inner_activation=True, inner_bias=True)
         table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
         feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
@@ -429,7 +433,7 @@ class MoeSpaceTimeModel(nn.Module):
         num_render_experts = 8
         render_feature_size = 8
         self.render_layer = MoeLayer(
-            experts=nn.ModuleList([render_class(scene_feature_size, inner_dim=64, output_dim=render_feature_size) for _ in range(num_render_experts)]),
+            experts=nn.ModuleList([render_class() for _ in range(num_render_experts)]),
             gate=feature_gate(),
             moe_args=MoeArgs(
                 num_experts=num_render_experts,
@@ -451,7 +455,6 @@ class MoeSpaceTimeModel(nn.Module):
         Concatenates position and time, sums geometric layer outputs, passes through table MoE and render layer, and finally predicts color and opacity.
         """
         pos, origin, t = point, origin, time
-        from einops import rearrange
 
         # Debug shapes
         print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
