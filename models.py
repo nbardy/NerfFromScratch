@@ -255,7 +255,7 @@ class SpaceTimeEmbedding(nn.Module):
 
 class SpacetimeGeometricMLP(nn.Module):
     # dpeth is how many hidden layers
-    def __init__(self, inner_bias=False, hidden_dim=16, depth=1):
+    def __init__(self, inner_bias=False, hidden_dim=16, depth=1, output_dim=4):
         super(SpacetimeGeometricMLP, self).__init__()
         self.embedding = SpaceTimeEmbedding()
         feature_input_dim = 8 + 4  # 8 for spherical embedding, + 4 for time embed
@@ -265,17 +265,14 @@ class SpacetimeGeometricMLP(nn.Module):
         for _ in range(depth):
             layers.extend([RMSNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim * 2, bias=inner_bias), GEGLU()])
 
-        layers.extend(
-            [
-                nn.Linear(hidden_dim * 2, 4),
-            ]
-        )
-
         self.feature_mlp = nn.Sequential(*layers)
+        self.final_layer = nn.Linear(hidden_dim * 2, output_dim)
 
-    def forward(self, x, t=None):
+    def forward(self, x):
         x = self.embedding(x)
         x = self.feature_mlp(x)
+        x = self.final_layer(x)
+
         return x
 
 
@@ -327,13 +324,11 @@ class SegGLUMLP(nn.Module):
 
         self.seglu_embed = SegluEmbed(self.cos_bias, self.sin_bias)
 
-        self.mlp = nn.Sequential(
-            self.seglu_embed,
-            nn.Linear(input_dim * 4, inner_dim),
-            GEGLU(),
-            *[RMSNorm(inner_dim * 2), nn.Linear(inner_dim * 2, inner_dim), GEGLU() for _ in range(depth)],
-            nn.Linear(inner_dim * 2, output_dim),
-        )
+        layers = [self.seglu_embed, nn.Linear(input_dim * 4, inner_dim), GEGLU()]
+        for _ in range(depth):
+            layers.extend([RMSNorm(inner_dim * 2), nn.Linear(inner_dim * 2, inner_dim), GEGLU()])
+        layers.append(nn.Linear(inner_dim * 2, output_dim))
+        self.mlp = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.mlp(x)
@@ -394,14 +389,14 @@ class MoeSpaceTimeModel(nn.Module):
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
-        geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4, depth=2) if use_attention_geo else SpacetimeGeometricMLP(depth=2)
-        render_class = TransformerEncoder(depth=2) if use_attention_render else SegGLUMLP(depth=2)
+        geo_class = lambda: SpaceTimeTransformerEncoder(output_dim=4, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(depth=2, inner_bias=False)
+        render_class = lambda: TransformerEncoder(model_depth=2) if use_attention_render else SegGLUMLP(depth=2)
         table_class = lambda: LearnableLookupTable(table_size, table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
         geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=1, output_dim=num_geo_experts)
         table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts)
-        feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False) # Since table size is large we want this to be single fast layer
+        feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
         num_geo_experts = 8
         self.geometric_layer = MoeLayer(
@@ -453,10 +448,11 @@ class MoeSpaceTimeModel(nn.Module):
         """
         pos, origin, t = point, origin, time
         from einops import rearrange
+
         # Debug shapes
         print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
         x = rearrange([pos, t], "b c -> b (c c1)")  # Concatenate position and time, resulting in a tensor of shape Bx4
-        all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
+        all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
 
         # We want the data selection to be based on a different geometry than the table index
@@ -465,7 +461,7 @@ class MoeSpaceTimeModel(nn.Module):
         #
         # The second projection should be free to project features for the expert
         #
-        # (Generally expert selection on input data is ideal for traditional experts, but here 
+        # (Generally expert selection on input data is ideal for traditional experts, but here
         #  our expert is a table not a function so we need to gate on a non-index value to allow
         # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
