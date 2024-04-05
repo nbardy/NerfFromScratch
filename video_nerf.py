@@ -211,7 +211,7 @@ def sample_n_points_from_tensors(
     return sampled_values
 
 
-def compute_accumulated_transmittance(alphas):
+def transmittance(alphas):
     # Compute accumulated transmittance along the ray
     accumulated_transmittance = torch.cumprod(alphas, 1)
     # Prepend ones to the start of each ray's transmittance for correct accumulation
@@ -226,23 +226,26 @@ def compute_accumulated_transmittance(alphas):
 
 def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192, T=0.1, args=None):
     device = ray_origins.device
+    # Convert hn and hf to scalar values if they are tensors
+    hn_scalar = hn.item() if torch.is_tensor(hn) else hn
+    hf_scalar = hf.item() if torch.is_tensor(hf) else hf
+
     # Sample points along each ray
-    t = torch.linspace(hn, hf, nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)
+    t = torch.linspace(hn_scalar, hf_scalar, nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)  # Bxnb_bins
     # Perturb sampling along each ray for stochastic sampling
-    mid = (t[:, :-1] + t[:, 1:]) / 2.0
-    lower = torch.cat((t[:, :1], mid), -1)
-    upper = torch.cat((mid, t[:, -1:]), -1)
-    u = torch.rand(t.shape, device=device)
-    t = lower + (upper - lower) * u  # Perturbed t values [batch_size, nb_bins]
+    mid = (t[:, :-1] + t[:, 1:]) / 2.0  # Midpoints for perturbation
+    lower = torch.cat((t[:, :1], mid), dim=-1)  # Lower bounds for perturbation
+    upper = torch.cat((mid, t[:, -1:]), dim=-1)  # Upper bounds for perturbation
+    u = torch.rand(t.shape, device=device)  # Uniform random values for perturbation
+    t = lower + (upper - lower) * u  # Perturbed t values [B, nb_bins]
     # Compute deltas for transmittance calculation
     delta = torch.cat(
         (
-            t[:, 1:] - t[:, :-1],
-            torch.tensor([1e10], device=device).expand(ray_origins.shape[0], 1),
+            t[:, 1:] - t[:, :-1],  # Delta values for all but the last bin
+            torch.tensor([1e10], device=device).expand(ray_origins.shape[0], 1),  # Large value for the last bin
         ),
-        -1,
-    )
-
+        dim=-1,
+    )  # [B, nb_bins]
     # Compute 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
@@ -255,7 +258,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
 
     # Compute alpha values and weights for color accumulation
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
-    weights = compute_accumulated_transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
+    weights = transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
 
     # Compute probability distribution for entropy regularization
     if args.enable_entropy_loss:
