@@ -108,7 +108,7 @@ class AngleEmbedding(nn.Module):
 
 class TransformerBlock(nn.Module):
     # https://arxiv.org/abs/2212.14034
-    def __init__(self, dim, heads, bias=False):
+    def __init__(self, dim, heads, bias=True):
         super().__init__()
         self.attention = FlashGQAAttention(dim=dim, heads=heads, qk_dim=64, v_dim=8)  # Attention on D dimension
         # fmt: off

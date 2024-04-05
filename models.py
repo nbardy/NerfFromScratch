@@ -381,7 +381,7 @@ class MoeLayer(nn.Module):
 #  This wrap our other model layers with MoE
 #
 class MoeSpaceTimeModel(nn.Module):
-    def __init__(self, use_attention_geo=True, use_attention_render=True):
+    def __init__(self, use_attention_geo=False, use_attention_render=True):
         super(MoeSpaceTimeModel, self).__init__()
 
         self.input_dim = 4
@@ -398,7 +398,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         geo_class = lambda: (SpaceTimeTransformerEncoder(output_dim=4, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP())
         render_class = lambda: (
-            TransformerEncoder(model_depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
+            TransformerEncoder(model_depth=8, input_dim=scene_feature_size, output_dim=render_feature_size)
             if use_attention_render
             else SegGLUMLP(depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
         )
@@ -458,6 +458,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         # Debug shapes
         # Concatenate position and time along the feature dimension
+        print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
         x = torch.cat([pos, t], dim=-1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
