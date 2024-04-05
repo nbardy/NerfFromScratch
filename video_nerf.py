@@ -224,14 +224,18 @@ def transmittance(alphas):
     )
 
 
-def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192, T=0.1, args=None):
+def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_samples, args=None):
     device = ray_origins.device
-    # Convert hn and hf to scalar values if they are tensors
-    hn_scalar = hn.item() if torch.is_tensor(hn) else hn
-    hf_scalar = hf.item() if torch.is_tensor(hf) else hf
+    nb_bins = num_samples
+    T = args.entropy_threshold if args.enable_entropy_loss else 0.1
+
+    near = torch.tensor(near, device=device)
+    far = torch.tensor(far, device=device)
 
     # Sample points along each ray
-    t = torch.linspace(hn_scalar, hf_scalar, nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)  # Bxnb_bins
+    hn = near
+    hf = far
+    t = torch.linspace(hn, hf, steps=nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)  # Bxnb_bins
     # Perturb sampling along each ray for stochastic sampling
     mid = (t[:, :-1] + t[:, 1:]) / 2.0  # Midpoints for perturbation
     lower = torch.cat((t[:, :1], mid), dim=-1)  # Lower bounds for perturbation
@@ -249,10 +253,11 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
     # Compute 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
-    ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
+    # ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
+    ray_origins = ray_origins.expand(nb_bins, ray_origins.shape[0], 3).transpose(0, 1)
 
     # Query NeRF model for colors and densities
-    colors, sigma = nerf_model(x.reshape(-1, 3), ray_directions.reshape(-1, 3))
+    colors, sigma = nerf_model(point=x.reshape(-1, 3), time=times, origin=ray_directions.reshape(-1, 3))
     colors = colors.reshape(x.shape)
     sigma = sigma.reshape(x.shape[:-1])
 
@@ -261,6 +266,9 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
     weights = transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
 
     # Compute probability distribution for entropy regularization
+    #
+    # Alpha total must be above a certain value, this minimizes the impact of the loss
+    # on empty space
     if args.enable_entropy_loss:
         prob = alpha / (alpha.sum(1).unsqueeze(1) + 1e-10)
         mask = alpha.sum(1).unsqueeze(1) > T
@@ -553,10 +561,10 @@ def train_video(
     scene_function = get_model(args.model)
 
     optimizer = torch.optim.Adam(
-        scene_function.parameters(),
+        list(scene_function.parameters()) + list(camera_position.parameters()),
         lr=args.lr,
-        # low Eps, high betas and small weight decay to train the lookup tables acording to instant ngp
-        betas=(0.99, 0.99999),
+        # low Eps, high betas and small weight decay to train the lookup tables according to instant ngp
+        betas=(0.99, 0.9999),
         eps=1e-9,
         weight_decay=args.weight_decay,
     )
@@ -865,6 +873,12 @@ if __name__ == "__main__":
         action="store_true",
         default=True,
         help="Enable entropy loss regularization.",
+    )
+    parser.add_argument(
+        "--entropy_threshold",
+        type=float,
+        default=None,
+        help="Entropy threshold for entropy loss.",
     )
     parser.add_argument(
         "--geo_style_text",

@@ -374,9 +374,22 @@ class SpaceTimeLookTable(nn.Module):
         # Final projection to color and alpha
         self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
 
-    def forward(self, pos, dir, t):
+    def debug_forward(self, point=None, time=None, ray=None):
+        print("Debug forward")
+        print(point, time, ray)
+
+        # Print the range min median and min and max
+        print("Point range: ", torch.min(point), torch.median(point), torch.max(point))
+        print("Time range: ", torch.min(time), torch.median(time), torch.max(time))
+        print("Ray range: ", torch.min(ray), torch.median(ray), torch.max(ray))
+
+    def forward(self, point=None, time=None, ray=None, debug_mode=False):
+        if debug_mode:
+            self.debug_forward(point, time, ray)
+        pos, dir, t = point, time, ray
         # Start by projecting with geo to look
         pos = self.geom_proj_mlp(pos, dir, t)
+
         # Scale pos and t to the table sizes using the scale_indices method
         idx0 = self.table0.scale_indices(pos)
         idx1 = self.table1.scale_indices(pos)
@@ -618,11 +631,12 @@ class MoeSpaceTimeModel(nn.Module):
         self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
         self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
 
-    def forward(self, pos, origin, t):
+    def forward(self, point=None, origin=None, time=None):
         """
         Processes input position, direction, and time through geometric, table, and render layers to produce color and opacity.
         Concatenates position and time, sums geometric layer outputs, passes through table MoE and render layer, and finally predicts color and opacity.
         """
+        pos, origin, t = point, origin, time
         x = torch.cat([pos, t.unsqueeze(-1)], dim=-1)  # Concatenate position and time
         all_geometric = self.geometric_layer(gate_inputs=x, inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
@@ -651,6 +665,7 @@ def get_model(model_name, input_dim=6):
         return GaussianFeatureMLP(input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0)
     elif model_name == "spacetime-lookup":
 
+        print("Using spacetime lookup table")
         return SpaceTimeLookTable(
             output_dim=4,
             inner_dim=64,

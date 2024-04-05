@@ -83,6 +83,7 @@ def video_depth(video_frames, cache_dir="cache", filename=None):
         print("Loading depth tensor from cache.")
         return torch.load(cache_path)
     else:
+        print("No depth cache, calculating depth")
         # Iterate over each frame and estimate depth
         depth_maps = [image_depth(frame, cache_dir) for frame in video_frames]
 
