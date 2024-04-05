@@ -71,6 +71,24 @@ def image_depth(image_tensor, cache_dir="cache"):
     return predicted_depth
 
 
+# Accepts a list of frames and stores the result in a cache
+def video_depth(video_frames, cache_dir="cache", filename=None):
+    assert filename is not None, "filename must be provided"
+
+    # Turn video file name into hash
+    # then store tensor there
+    hash_f = hashlib.sha256(filename.encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, f"{hash_f}.pt")
+    if os.path.exists(cache_path):
+        print("Loading depth tensor from cache.")
+        return torch.load(cache_path)
+    else:
+        # Iterate over each frame and estimate depth
+        depth_maps = [image_depth(frame, cache_dir) for frame in video_frames]
+
+    return depth_maps
+
+
 # Let's make a new normalize that expect a tensor to be on gpu and normalized and we pass it right to the model
 def depth_pt_prop_deriv(image_tensor):
     model = initialize_model()

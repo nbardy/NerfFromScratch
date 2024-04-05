@@ -476,19 +476,36 @@ class SegGLUMLP(nn.Module):
         super(SegGLUMLP, self).__init__()
         self.cos_bias = nn.Parameter(torch.zeros(1))
         self.sin_bias = nn.Parameter(torch.zeros(1))
-        self.seglu_embed = lambda x: torch.cat(
-            (torch.sin(x + self.sin_bias), torch.sin(F.silu(x + self.sin_bias)), torch.cos(x + self.cos_bias), torch.cos(F.silu(x + self.cos_bias))), dim=-1
-        )  # * 4 the size
-        self.seglu = lambda x: torch.cat([x, F.silu(x)], dim=-1)
+
+        # Define seglu_embed as a module to enable proper parameter registration
+        class SegluEmbed(nn.Module):
+            def __init__(self, cos_bias, sin_bias):
+                super().__init__()
+                self.cos_bias = cos_bias
+                self.sin_bias = sin_bias
+
+            def forward(self, x):
+                return torch.cat(
+                    (torch.sin(x + self.sin_bias), torch.sin(F.silu(x + self.sin_bias)), torch.cos(x + self.cos_bias), torch.cos(F.silu(x + self.cos_bias))),
+                    dim=-1,
+                )  # Output size: B x (input_dim * 4)
+
+        # Define seglu as a module
+        class Seglu(nn.Module):
+            def forward(self, x):
+                return torch.cat([x, F.silu(x)], dim=-1)  # Output size: B x (input_dim * 2)
+
+        self.seglu_embed = SegluEmbed(self.cos_bias, self.sin_bias)
+        self.seglu = Seglu()
 
         self.mlp = nn.Sequential(
             self.seglu_embed,
             RMSNorm(input_dim * 4),
             nn.Linear(input_dim * 4, inner_dim),
-            self.seglu(),
-            RMSNorm(input_dim * 4),
+            self.seglu,
+            RMSNorm(inner_dim * 2),
             nn.Linear(inner_dim * 2, inner_dim),
-            self.seglu(),
+            self.seglu,
             RMSNorm(inner_dim * 2),
             nn.Linear(inner_dim * 2, output_dim),
         )

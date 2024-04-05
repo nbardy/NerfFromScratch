@@ -16,7 +16,7 @@ from utils import get_default_device
 from preprocess import blur_scores, deblur_video_vrt, load_video, get_image_feature_difference_scores
 from peft import inject_adapter_in_model, LoraConfig
 
-from depth import image_depth
+from depth import video_depth
 from style import embed_text, embed_image
 
 camera_depth = 0.2
@@ -107,18 +107,40 @@ def normalize_edge_detection(tensor):
     """
     Applies Sobel filter for edge detection and normalizes the result to a 0-1 range.
     """
-    print(f"Input tensor size: {tensor.size()}")  # Print input tensor size
-    # Compute the mean across the batch dimension and apply Sobel filter with normalization
-    edge_mask = kornia.filters.sobel(tensor.mean(dim=0, keepdim=True), normalized=True, eps=1e-6)  # 1xCxHxW
+
+    print("t0", tensor.shape)
+
+    # Ensure tensor is in the correct shape BxCxHxW for kornia.filters.sobel
+    if tensor.dim() == 3:  # CxHxW
+        tensor = tensor.unsqueeze(0)  # Add batch dimension: 1xCxHxW
+    elif tensor.dim() != 4:
+        raise ValueError(f"Expected tensor to be 3 or 4 dimensions, got {tensor.dim()}")
+
+    print("t1", tensor.shape)
+
+    tensor = rearrange(tensor, "b h w c -> b c h w")
+
+    print("t2", tensor.shape)
+
+    # Apply Sobel filter with normalization
+    edge_mask = kornia.filters.sobel(tensor, normalized=True, eps=1e-6)  # 1x1xHxW
+
     # Normalize the edge mask to have values between 0 and 1
     min_val, max_val = edge_mask.min(), edge_mask.max()
-    edge_mask_normalized = (edge_mask - min_val) / (max_val - min_val)  # 1xCxHxW
-    return edge_mask_normalized.squeeze()  # HxW
+    edge_mask_normalized = (edge_mask - min_val) / (max_val - min_val)  # 1x1xHxW
+
+    return edge_mask_normalized.squeeze()  # HxW if single channel, BxHxW if batched
 
 
 def sample_indices(prob_dist, n_samples, total_pixels):
     # Flatten the probability distribution
+    print(prob_dist.shape)
     prob_dist_flat = prob_dist.view(-1)
+    # Debug: Print min and max of the probability distribution
+    print("N_samples", n_samples)
+    # prod dist size
+    print("prob_dist_flat", prob_dist_flat.shape)
+    print(f"Min prob: {prob_dist_flat.min()}, Max prob: {prob_dist_flat.max()}")
     # Sample indices based on the probability distribution without replacement
     indices = torch.multinomial(prob_dist_flat, n_samples, replacement=False)
     return indices
@@ -136,7 +158,7 @@ def sample_n_points_from_tensors(
     if boost_edge:
         # Edge detection and normalization for all tensors in the batch
         # use first image tensor RGB as the base for edge detection
-        stacked_tensors = torch.stack(image_tensors[0])  # BxCxHxW
+        stacked_tensors = image_tensors[0]  # CxHxW
         edge_masks = normalize_edge_detection(stacked_tensors)  # BxHxW
         blurred_edge_masks = kornia.filters.box_blur(edge_masks.unsqueeze(1), kernel_size=(5, 5)).squeeze(1)  # BxHxW
         # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
@@ -145,14 +167,28 @@ def sample_n_points_from_tensors(
         n_blurred_edge = n_points - n_uniform - n_edge  # Remaining for blurred edge
 
         # Generate probability distribution for uniform sampling
-        uniform_prob_dist = torch.ones(total_pixels) / total_pixels
-        uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)
+        # Uniform probability distribution for uniform sampling
+        uniform_prob_dist = torch.full((total_pixels,), 1.0 / total_pixels, device=image_tensors[0].device)  # total_pixels
+        print("uniform_prob_dist shape:", uniform_prob_dist.shape)  # Debug print
+        uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)  # n_uniform
 
-        # Weighted sampling for edge and blurred edge based on edge detection per frame
+        # Compute mean edge weights for edge and blurred edge masks
         edge_weights = edge_masks.view(edge_masks.size(0), -1).mean(dim=1)  # B
         blurred_edge_weights = blurred_edge_masks.view(blurred_edge_masks.size(0), -1).mean(dim=1)  # B
-        edge_indices = sample_indices(edge_weights, n_edge, total_pixels)
-        blurred_edge_indices = sample_indices(blurred_edge_weights, n_blurred_edge, total_pixels)
+
+        # Normalize edge weights to create a probability distribution
+        edge_weights /= edge_weights.sum()
+        blurred_edge_weights /= blurred_edge_weights.sum()
+
+        # Expand edge weights to match the total number of pixels for sampling
+        edge_prob_dist = edge_weights.repeat_interleave(total_pixels // edge_weights.size(0))  # total_pixels
+        blurred_edge_prob_dist = blurred_edge_weights.repeat_interleave(total_pixels // blurred_edge_weights.size(0))  # total_pixels
+
+        print("edge_prob_dist shape:", edge_prob_dist.shape)  # Debug print
+        print("blurred_edge_prob_dist shape:", blurred_edge_prob_dist.shape)  # Debug print
+        # Weighted sampling for edge and blurred edge based on normalized weights
+        edge_indices = sample_indices(edge_prob_dist, n_edge, total_pixels)  # n_edge
+        blurred_edge_indices = sample_indices(blurred_edge_prob_dist, n_blurred_edge, total_pixels)  # n_blurred_edge
 
         # Combine and shuffle indices
         combined_indices = torch.cat((uniform_indices, edge_indices, blurred_edge_indices))
@@ -400,16 +436,16 @@ def sample_with_scores_and_runs(
     n_cluster = n_frames - n_uniform - n_diff - n_blur
 
     # Uniform random sampling
-    uniform_indices = torch.randperm(len(video_frames))[:n_uniform]
+    uniform_indices = torch.randperm(len(video_frames))[:n_uniform].to(video_frames[0].device)
 
     # Sampling based on differences (maximized)
-    diff_indices = torch.argsort(torch.tensor(differences), descending=True)[:n_diff]
+    diff_indices = torch.argsort(torch.tensor(differences, device=video_frames[0].device), descending=True)[:n_diff]
 
     # Sampling based on minimal blur
-    blur_indices = torch.argsort(torch.tensor(blur_scores))[:n_blur]
+    blur_indices = torch.argsort(torch.tensor(blur_scores, device=video_frames[0].device))[:n_blur]
 
     # Clustered sampling with exponential offset pattern
-    cluster_indices = torch.empty(0, dtype=torch.int)
+    cluster_indices = torch.empty(0, dtype=torch.int, device=video_frames[0].device)
     video_length = len(video_frames)
     frames_per_run = max(1, n_cluster // cluster_run_count)  # Ensure at least 1 frame per run
     for _ in range(cluster_run_count):
@@ -420,22 +456,24 @@ def sample_with_scores_and_runs(
             cluster_run_count,
             cluster_scale,
         )
-        cluster_indices = torch.cat((cluster_indices, indices))
-        cluster_indices = cluster_indices.unique()
+        cluster_indices = torch.cat((cluster_indices, indices.to(video_frames[0].device)))
+        cluster_indices = torch.unique(cluster_indices)
         # Break early if we've reached or exceeded the desired number of cluster frames
-        if cluster_indices.size(0) >= n_cluster:
+        if cluster_indices.numel() >= n_cluster:
             break
     # Ensure the number of cluster frames is exactly n_cluster by randomly selecting if over
-    if cluster_indices.size(0) > n_cluster:
-        cluster_indices = cluster_indices[torch.randperm(cluster_indices.size(0))[:n_cluster]]
+    if cluster_indices.numel() > n_cluster:
+        cluster_indices = cluster_indices[torch.randperm(cluster_indices.numel())[:n_cluster]]
 
     # Combine and deduplicate indices
+    for index_list in [uniform_indices, diff_indices, blur_indices, cluster_indices]:
+        print(index_list.device)
     all_indices = torch.cat((uniform_indices, diff_indices, blur_indices, cluster_indices))
     unique_indices = torch.unique(all_indices)
 
     # If deduplication leads to fewer frames, sample randomly to fill the gap
-    if len(unique_indices) < n_frames:
-        additional_indices = torch.randperm(len(video_frames))[: n_frames - len(unique_indices)]
+    if unique_indices.numel() < n_frames:
+        additional_indices = torch.randperm(len(video_frames), device=video_frames[0].device)[: n_frames - unique_indices.numel()]
         unique_indices = torch.unique(torch.cat((unique_indices, additional_indices)))
 
     # Select frames based on indices
@@ -518,7 +556,7 @@ def train_video(
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     device = get_default_device()
-    video_frames, video_fps = load_video(video_path, max_frames=max_frames)
+    video_frames = load_video(video_path, max_frames=max_frames)
 
     size = video_frames[0].shape
     size = [size[1], size[2]]
@@ -526,8 +564,7 @@ def train_video(
     scene_function.to(device)
     camera_position.to(device)
 
-    # Precompute depth for each image
-    depth_maps = [image_depth(video_frames[i].to(device)) for i in range(max_frames)]
+    depth_maps = video_depth(video_frames, cache_dir="cache", filename=video_path)
 
     for epoch in range(epochs):
         sampled_frames, sampled_indices = sample_video_frames_by_args(

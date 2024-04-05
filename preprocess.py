@@ -228,11 +228,11 @@ def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> tor
     """
 
     print("====")
-    print("Processing video frames")
+    print("Processing video frames [begin]")
     print("====")
     all_features = process_video_frames(video_frames)  # TxPxD
     print("====")
-    print("Processing video frames done")
+    print("Processing video frames [end]")
     print("====")
 
     feature_frames_tensor = all_features
@@ -337,7 +337,7 @@ def main():
 
     print(f"Processing video: {video_path}")
 
-    video_frames, video_fps = load_video(video_path)
+    video_frames = load_video(video_path)
     differences_start_time = time.time()
     differences = get_image_feature_difference_scores(video_frames)
     differences_end_time = time.time()

@@ -128,7 +128,7 @@ class SpaceTimeEmbedding(nn.Module):
 
         spherical_embedding_dim = depth - 1
         time_embedding_dim = 1
-        self.spherical_embedding = SphericalEmbedding(input_dim=3, dim=projection_dim, depth=spherical_embedding_dim)
+        self.spherical_embedding = SphericalEmbedding(dim=projection_dim, depth=spherical_embedding_dim)
         self.angle_embedding = AngleEmbedding(input_dim=1, projection_dim=projection_dim, depth=time_embedding_dim)
 
     def forward(self, xyzt):
