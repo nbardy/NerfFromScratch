@@ -277,186 +277,6 @@ class SpacetimeGeometricProjectionMLP(nn.Module):
         return x
 
 
-# This crosses offset lists of 3D and 4D space and time
-def generate_space_time_offsets(spatial_offsets, temporal_offsets):
-    """
-    Generates a comprehensive list of offsets for neighbor lookups in space-time,
-    combining spatial and temporal offsets.
-
-    Parameters:
-    - spatial_offsets: List of tuples representing spatial shifts.
-    - temporal_offsets: List of tuples representing temporal shifts.
-
-    Returns:
-    - A list of combined space-time offsets.
-    """
-    combined_offsets = []
-    # Combine each spatial offset with each temporal offset
-    for spatial_offset in spatial_offsets:
-        for temporal_offset in temporal_offsets:
-            combined_offsets.append(spatial_offset + (temporal_offset[3],))
-
-    return combined_offsets
-
-
-# This is the authors attempt to impliment a naive lookup table version of instantNGP for videos over time
-# - Nicholas Bardy
-#
-# For fast training without the custom CUDA/triton code
-#
-# We extend this to the temporal dimension for time by adding some time lookup tables, we also
-#
-# Since the high resolution temporal lookup tables can we large we keep the feature size low
-# we use a nearest neighbor lookup for the temporal dimensions to expand the feature size at
-# inference time
-from geometry import face_directions, corner_directions, temporal_directions, exponential_temporal_directions
-
-
-class SpaceTimeLookTable(nn.Module):
-    basic_space_time_offsets = generate_space_time_offsets(face_directions + corner_directions, temporal_directions)
-    exponential_time_offsets = generate_space_time_offsets(basic_space_time_offsets, exponential_temporal_directions)
-
-    def __init__(self, output_dim=4, inner_dim=64, use_attention=True):
-        super(SpaceTimeLookTable, self).__init__()
-        # Define the lookup tables for spatial features
-        self.table0 = LearnableLookupTable((128, 128, 128), 64)
-        self.table1 = LearnableLookupTable((64, 64, 64), 64 * 8)
-        self.table2 = LearnableLookupTable((32, 32, 32), 64 * 8 * 8)
-        self.table3 = LearnableLookupTable((16, 16, 16), 64 * 8 * 8 * 8)
-
-        # Define the lookup tables for spacetime features
-        self.space_time_table_1 = LearnableLookupTable((16, 16, 16, 64), 64)  # 16x16x16x64x64
-        self.space_time_table_2 = LearnableLookupTable((128, 128, 64, 16), 8)  # 128x128x64x16x8
-
-        # We sample all corner neighbors and we do it in time direction exponentialy [-64, -8, -4, -2, -1, 0, 1, 2, 4, 8, 64]
-        # We sample 10 frames in each direction and we do it in 3 time steps
-        self.time_focus_spacetime_table3 = LearnableLookupTable((4, 4, 4, 512 * 512), 8)
-
-        from transformers_model_code import SpaceTimeTransformerEncoder
-
-        if use_attention:
-            self.geom_proj_mlp = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
-        else:
-            self.geom_proj_mlp = SpacetimeGeometricProjectionMLP(has_t=True)
-
-        # Linear layer to downsize feature dimension and append viewing direction
-        # The input dimension calculation is broken down as follows:
-        total_feature_size = (
-            # table0 x sampled for 6 face + 1 base
-            64 * (6 + 1)
-            # table1 x sampled for 6 face + 1 base
-            + (64 * 8) * (6 + 1)
-            # table2 x sampled for 6 face + 1 base
-            + (64 * 8 * 8) * (6 + 1)
-            # table3 x sampled for 6 face + 1 base
-            + (64 * 8 * 8 * 8) * (6 + 1)
-            # time_space_table1 * 6 faces + 8 corners * 3 (before, current, after)
-            + (64 * ((6 + 8) * 3))
-            # time_space_table2 * 8 corners* 3 (before, current, after)
-            + 8 * ((6 + 8) * 3)
-            # time_focus_spacetime_table3 * 8
-            + 8 * (11 * 8)
-        )
-
-        if use_attention:
-            self.value_mlp = SpaceTimeTransformerEncoder(
-                input_dim=total_feature_size, output_dim=inner_dim, embedding_depth=8, projection_dim=inner_dim, heads=8, model_depth=1
-            )
-        else:
-            self.value_mlp = nn.Sequential(
-                RMSNorm(total_feature_size),
-                nn.Linear(total_feature_size, total_feature_size * 2, bias=False),
-                GEGLU(),
-                RMSNorm(total_feature_size * 2),
-                nn.Linear(total_feature_size, inner_dim, bias=False),
-            )
-
-        # Final projection to color and alpha
-        self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
-
-    def debug_forward(self, point=None, time=None, ray=None):
-        print("Debug forward")
-        print(point, time, ray)
-
-        # Print the range min median and min and max
-        print("Point range: ", torch.min(point), torch.median(point), torch.max(point))
-        print("Time range: ", torch.min(time), torch.median(time), torch.max(time))
-        print("Ray range: ", torch.min(ray), torch.median(ray), torch.max(ray))
-
-    def forward(self, point=None, time=None, ray=None, debug_mode=False):
-        if debug_mode:
-            self.debug_forward(point, time, ray)
-        pos, dir, t = point, time, ray
-        # Start by projecting with geo to look
-        pos = self.geom_proj_mlp(pos, dir, t)
-
-        # Scale pos and t to the table sizes using the scale_indices method
-        idx0 = self.table0.scale_indices(pos)
-        idx1 = self.table1.scale_indices(pos)
-        idx2 = self.table2.scale_indices(pos)
-        idx3 = self.table3.scale_indices(pos)
-
-        # Combine pos and t for 4D indexing in space_time_table_1
-        # Concatenate position and time for 4D tensor Bx4
-        pos_t = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
-        # Scale indices for space-time tables
-        idx_space_time_table_1 = self.space_time_table_1.scale_indices(pos_t)
-        idx_space_time_table_2 = self.space_time_table_2.scale_indices(pos_t)
-        idx_time_focus = self.time_focus_spacetime_table3.scale_indices(pos_t)
-
-        # Get base features from spatial tables
-        base_features0 = self.table0.forward_without_scale(idx0)  # BxCxHxW
-        base_features1 = self.table1(idx1)  # BxCxHxW
-        base_features2 = self.table2(idx2)  # BxCxHxW
-        base_features3 = self.table3(idx3)  # BxCxHxW
-
-        # Get neighbor features from spatial tables
-        neighbor_indices_0 = lookup_neighbors(idx0, self.face_directions, self.table0)
-        neighbor_indices_1 = lookup_neighbors(idx1, self.face_directions, self.table1)
-        neighbor_indices_2 = lookup_neighbors(idx2, self.face_directions, self.table2)
-        neighbor_indices_3 = lookup_neighbors(idx3, self.face_directions, self.table3)
-
-        neighbor_features0 = self.table0.forward_without_scale(neighbor_indices_0)
-        neighbor_features1 = self.table1.forward_without_scale(neighbor_indices_1)
-        neighbor_features2 = self.table2.forward_without_scale(neighbor_indices_2)
-        neighbor_features3 = self.table3.forward_without_scale(neighbor_indices_3)
-
-        # All features tensors are of shape Bx((1+N)*C)xHxW
-        # Lookup temporal features using the new utility function
-        spacetime_features_1 = self.space_time_table_1.forward_without_scale(idx_space_time_table_1)
-        spacetime_features_2 = self.space_time_table_2.forward_without_scale(idx_space_time_table_2)
-        time_focus_features = self.time_focus_spacetime_table3.forward_without_scale(idx_time_focus)
-
-        # Combine base and neighbor features for all tables
-        features0 = torch.cat([base_features0, neighbor_features0], dim=1)
-        features1 = torch.cat([base_features1, neighbor_features1], dim=1)
-        features2 = torch.cat([base_features2, neighbor_features2], dim=1)
-        features3 = torch.cat([base_features3, neighbor_features3], dim=1)
-
-        # Concatenate all features
-        all_features = torch.cat(
-            [
-                features0,
-                features1,
-                features2,
-                features3,
-                spacetime_features_1,
-                spacetime_features_2,
-                time_focus_features,
-            ],
-            dim=-1,
-        )
-
-        # Downsize feature dimension and append viewing direction and timestep
-        downsized_features = self.value_mlp(all_features)
-        final_features = torch.cat([downsized_features, dir, t.unsqueeze(-1)], dim=-1)
-
-        # Apply a biasless linear hidden layer
-        output = self.final_projection(final_features)
-
-        return output
-
-
 ####
 ###
 # Mixture of Expert Models
@@ -674,6 +494,184 @@ def get_model(model_name, input_dim=6):
         return MoeSpaceTimeModel()
     else:
         raise ValueError(f"Model {model_name} not found")
+
+
+# This is the authors attempt to impliment a naive lookup table version of instantNGP for videos over time
+# - Nicholas Bardy
+#
+# For fast training without the custom CUDA/triton code
+#
+# This introduces a set of lookup tables at different resolutions in time and space to build features.
+# I have abandoned his for feavoring identical lookup tables with expert gating for a simpler approach
+# with similar effects
+from geometry import face_directions, corner_directions, temporal_directions, exponential_temporal_directions
+
+
+# This crosses offset lists of 3D and 4D space and time
+def generate_space_time_offsets(spatial_offsets, temporal_offsets):
+    """
+    Generates a comprehensive list of offsets for neighbor lookups in space-time,
+    combining spatial and temporal offsets.
+
+    Parameters:
+    - spatial_offsets: List of tuples representing spatial shifts.
+    - temporal_offsets: List of tuples representing temporal shifts.
+
+    Returns:
+    - A list of combined space-time offsets.
+    """
+    combined_offsets = []
+    # Combine each spatial offset with each temporal offset
+    for spatial_offset in spatial_offsets:
+        for temporal_offset in temporal_offsets:
+            combined_offsets.append(spatial_offset + (temporal_offset[3],))
+
+    return combined_offsets
+
+
+class SpaceTimeLookTable(nn.Module):
+    basic_space_time_offsets = generate_space_time_offsets(face_directions + corner_directions, temporal_directions)
+    exponential_time_offsets = generate_space_time_offsets(basic_space_time_offsets, exponential_temporal_directions)
+
+    def __init__(self, output_dim=4, inner_dim=64, use_attention=True):
+        super(SpaceTimeLookTable, self).__init__()
+        # Define the lookup tables for spatial features
+        self.table0 = LearnableLookupTable((128, 128, 128), 64)
+        self.table1 = LearnableLookupTable((64, 64, 64), 64 * 8)
+        self.table2 = LearnableLookupTable((32, 32, 32), 64 * 8 * 8)
+        self.table3 = LearnableLookupTable((16, 16, 16), 64 * 8 * 8 * 8)
+
+        # Define the lookup tables for spacetime features
+        self.space_time_table_1 = LearnableLookupTable((16, 16, 16, 64), 64)  # 16x16x16x64x64
+        self.space_time_table_2 = LearnableLookupTable((128, 128, 64, 16), 8)  # 128x128x64x16x8
+
+        # We sample all corner neighbors and we do it in time direction exponentialy [-64, -8, -4, -2, -1, 0, 1, 2, 4, 8, 64]
+        # We sample 10 frames in each direction and we do it in 3 time steps
+        self.time_focus_spacetime_table3 = LearnableLookupTable((4, 4, 4, 512 * 512), 8)
+
+        from transformers_model_code import SpaceTimeTransformerEncoder
+
+        if use_attention:
+            self.geom_proj_mlp = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
+        else:
+            self.geom_proj_mlp = SpacetimeGeometricProjectionMLP(has_t=True)
+
+        # Linear layer to downsize feature dimension and append viewing direction
+        # The input dimension calculation is broken down as follows:
+        total_feature_size = (
+            # table0 x sampled for 6 face + 1 base
+            64 * (6 + 1)
+            # table1 x sampled for 6 face + 1 base
+            + (64 * 8) * (6 + 1)
+            # table2 x sampled for 6 face + 1 base
+            + (64 * 8 * 8) * (6 + 1)
+            # table3 x sampled for 6 face + 1 base
+            + (64 * 8 * 8 * 8) * (6 + 1)
+            # time_space_table1 * 6 faces + 8 corners * 3 (before, current, after)
+            + (64 * ((6 + 8) * 3))
+            # time_space_table2 * 8 corners* 3 (before, current, after)
+            + 8 * ((6 + 8) * 3)
+            # time_focus_spacetime_table3 * 8
+            + 8 * (11 * 8)
+        )
+
+        if use_attention:
+            self.value_mlp = SpaceTimeTransformerEncoder(
+                input_dim=total_feature_size, output_dim=inner_dim, embedding_depth=8, projection_dim=inner_dim, heads=8, model_depth=1
+            )
+        else:
+            self.value_mlp = nn.Sequential(
+                RMSNorm(total_feature_size),
+                nn.Linear(total_feature_size, total_feature_size * 2, bias=False),
+                GEGLU(),
+                RMSNorm(total_feature_size * 2),
+                nn.Linear(total_feature_size, inner_dim, bias=False),
+            )
+
+        # Final projection to color and alpha
+        self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
+
+    def debug_forward(self, point=None, time=None, ray=None):
+        print("Debug forward")
+        print(point, time, ray)
+
+        # Print the range min median and min and max
+        print("Point range: ", torch.min(point), torch.median(point), torch.max(point))
+        print("Time range: ", torch.min(time), torch.median(time), torch.max(time))
+        print("Ray range: ", torch.min(ray), torch.median(ray), torch.max(ray))
+
+    def forward(self, point=None, time=None, ray=None, debug_mode=False):
+        if debug_mode:
+            self.debug_forward(point, time, ray)
+        pos, dir, t = point, time, ray
+        # Start by projecting with geo to look
+        pos = self.geom_proj_mlp(pos, dir, t)
+
+        # Scale pos and t to the table sizes using the scale_indices method
+        idx0 = self.table0.scale_indices(pos)
+        idx1 = self.table1.scale_indices(pos)
+        idx2 = self.table2.scale_indices(pos)
+        idx3 = self.table3.scale_indices(pos)
+
+        # Combine pos and t for 4D indexing in space_time_table_1
+        # Concatenate position and time for 4D tensor Bx4
+        pos_t = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
+        # Scale indices for space-time tables
+        idx_space_time_table_1 = self.space_time_table_1.scale_indices(pos_t)
+        idx_space_time_table_2 = self.space_time_table_2.scale_indices(pos_t)
+        idx_time_focus = self.time_focus_spacetime_table3.scale_indices(pos_t)
+
+        # Get base features from spatial tables
+        base_features0 = self.table0.forward_without_scale(idx0)  # BxCxHxW
+        base_features1 = self.table1(idx1)  # BxCxHxW
+        base_features2 = self.table2(idx2)  # BxCxHxW
+        base_features3 = self.table3(idx3)  # BxCxHxW
+
+        # Get neighbor features from spatial tables
+        neighbor_indices_0 = lookup_neighbors(idx0, self.face_directions, self.table0)
+        neighbor_indices_1 = lookup_neighbors(idx1, self.face_directions, self.table1)
+        neighbor_indices_2 = lookup_neighbors(idx2, self.face_directions, self.table2)
+        neighbor_indices_3 = lookup_neighbors(idx3, self.face_directions, self.table3)
+
+        neighbor_features0 = self.table0.forward_without_scale(neighbor_indices_0)
+        neighbor_features1 = self.table1.forward_without_scale(neighbor_indices_1)
+        neighbor_features2 = self.table2.forward_without_scale(neighbor_indices_2)
+        neighbor_features3 = self.table3.forward_without_scale(neighbor_indices_3)
+
+        # All features tensors are of shape Bx((1+N)*C)xHxW
+        # Lookup temporal features using the new utility function
+        spacetime_features_1 = self.space_time_table_1.forward_without_scale(idx_space_time_table_1)
+        spacetime_features_2 = self.space_time_table_2.forward_without_scale(idx_space_time_table_2)
+        time_focus_features = self.time_focus_spacetime_table3.forward_without_scale(idx_time_focus)
+
+        # Combine base and neighbor features for all tables
+        features0 = torch.cat([base_features0, neighbor_features0], dim=1)
+        features1 = torch.cat([base_features1, neighbor_features1], dim=1)
+        features2 = torch.cat([base_features2, neighbor_features2], dim=1)
+        features3 = torch.cat([base_features3, neighbor_features3], dim=1)
+
+        # Concatenate all features
+        all_features = torch.cat(
+            [
+                features0,
+                features1,
+                features2,
+                features3,
+                spacetime_features_1,
+                spacetime_features_2,
+                time_focus_features,
+            ],
+            dim=-1,
+        )
+
+        # Downsize feature dimension and append viewing direction and timestep
+        downsized_features = self.value_mlp(all_features)
+        final_features = torch.cat([downsized_features, dir, t.unsqueeze(-1)], dim=-1)
+
+        # Apply a biasless linear hidden layer
+        output = self.final_projection(final_features)
+
+        return output
 
 
 # If main test models
