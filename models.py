@@ -457,8 +457,8 @@ class MoeSpaceTimeModel(nn.Module):
         pos, origin, t = point, origin, time
 
         # Debug shapes
-        print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
-        x = rearrange([pos, t], "b c -> b (c c1)")  # Concatenate position and time, resulting in a tensor of shape Bx4
+        # Concatenate position and time along the feature dimension
+        x = torch.cat([pos, t], dim=-1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
 
