@@ -2,7 +2,7 @@ import torch
 
 
 def debug_tensor(name, tensor):
-    print(f"{name} min: {tensor.min()}, max: {tensor.max()}, shape: {tensor.shape}")
+    print(f"{name:<20} min: {tensor.min():<10}, max: {tensor.max():<10}, shape: {tensor.shape}")
 
 
 def get_default_device():
