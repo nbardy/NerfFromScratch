@@ -1,7 +1,12 @@
 import torch
 
 
+def debug_tensor(name, tensor):
+    print(f"{name} min: {tensor.min()}, max: {tensor.max()}, shape: {tensor.shape}")
+
+
 def get_default_device():
+    print("Checking device...")
     if torch.backends.mps.is_available():
         # Apple Silicon GPU available
         device = torch.device("mps")

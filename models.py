@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
+from utils import debug_tensor
 
 from einops import rearrange
 
@@ -121,9 +122,9 @@ class LearnableLookupTable(nn.Module):
         self.dims = dims
         self.table = nn.Parameter(torch.randn(*dims, feature_size))
 
+    # Scales indices from 0-1 range to table cell range
     def scale_indices(self, indices):
-        # User manually scales indices from 0-1 range to table cell range
-        scaled_indices = (indices * (torch.tensor(self.dims).float() - 1)).long()
+        scaled_indices = (indices * (torch.tensor(self.dims, device=indices.device).float() - 1)).long()
         return scaled_indices
 
     def forward_without_scale(self, indices):
@@ -283,10 +284,12 @@ class SpacetimeGeometricMLP(nn.Module):
         self.final_layer = nn.Linear(self.final_size, output_dim)
 
     def debug_forward(self, x):
+        print("debug spacetime geo mlp forward")
         print("final_size", self.final_size)
         print("x", x.shape)
 
     def forward(self, x):
+
         self.debug_forward(x)
         x = self.embedding(x)
         x = self.feature_mlp(x)
@@ -367,32 +370,58 @@ class MoeArgs(Serializable):
 
 # MoE layer to gate an arbitary set of models
 class MoeLayer(nn.Module):
-    def __init__(self, experts: List[nn.Module], gate: nn.Module, moe_args: MoeArgs):
+    def __init__(self, experts: List[nn.Module], gate: nn.Module, moe_args: MoeArgs, pool="sum"):
         super().__init__()
         assert len(experts) > 0
+        # assert pool is append or sum
+        assert pool in ["append", "sum"]
+        self.pool_op = pool
         self.experts = nn.ModuleList(experts)
         self.gate = gate
         self.args = moe_args
 
+    # pool the item based on append or sum
+    def pool(self, results, item):
+        if self.pool_op == "append":
+            results = [item] if results is None else results + [item]
+        elif self.pool_op == "sum":
+            results = item if results is None else results + item
+        return results
+
     def forward(self, inputs: torch.Tensor, gate_inputs: torch.Tensor = None):
+        print("Moe Layer forward pass")
         if gate_inputs is None:
             gate_inputs = inputs
         gate_logits = self.gate(gate_inputs)
+
+        debug_tensor("gate_logits", gate_logits)
         weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
-        results = torch.zeros_like(inputs)
-        # results = []
+        results = None
+
+        debug_tensor("selected experts", selected_experts)
+        debug_tensor("weights", weights)
 
         # Process default experts
         if self.args.num_default_experts > 0:
             default_experts = self.experts[: self.args.num_default_experts]
             for default_expert in default_experts:
-                results += default_expert(inputs)
+                print("calling default expert")
+                expert_result = default_expert(inputs)
+                debug_tensor("expert result", expert_result)
+
+                results = self.pool(results, expert_result)
 
         # Process selected experts
         for i, expert in enumerate(self.experts[self.args.num_default_experts :], start=self.args.num_default_experts):
             batch_idx, nth_expert = torch.where(selected_experts == i - self.args.num_default_experts)
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx])
+            print("i", i)
+            debug_tensor("calling selected expert, expert index", torch.tensor([i]))
+            debug_tensor("batch_idx", batch_idx)
+            debug_tensor("nth_expert", nth_expert)
+            debug_tensor("inputs", inputs)
+            results = self.pool(results, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]))
+
         return results
 
 
@@ -407,21 +436,29 @@ class MoeSpaceTimeModel(nn.Module):
 
         self.input_dim = 4
 
-        # Expert counts for tables
-        table_size = (64, 64, 64, 128)
-        table_feature_size = 16
-
         num_geo_experts_total = 8
         num_geo_default_experts = 1
         num_geo_experts_chosen = 1
 
-        num_total_tables = 40
-        num_table_default_experts = 2
-        num_table_experts_chosen = 2
+        # table_size = (64, 64, 64, 128)
+        # table_feature_size = 16
+        # num_total_tables = 16
+        # num_table_default_experts = 2
+        # num_table_experts_chosen = 2
+
+        # test smaller
+        table_size = (8, 8)
+        table_feature_size = 8
+        num_total_tables = 8
+        num_table_default_experts = 1
+        num_table_experts_chosen = 1
 
         num_render_experts_total = 16
         num_render_default_experts = 1
         num_render_experts_chosen = 1
+
+        num_render_experts = 8
+        render_feature_size = 8
 
         num_active_tables = num_geo_experts_chosen + num_table_experts_chosen
         scene_feature_size = num_active_tables * table_feature_size
@@ -452,8 +489,11 @@ class MoeSpaceTimeModel(nn.Module):
             ),
         )
 
+        print("Creating table moe")
+
         self.table_moe = MoeLayer(
             experts=nn.ModuleList([table_class() for _ in range(num_total_tables)]),
+            pool="append",
             gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_active_tables,
@@ -462,8 +502,7 @@ class MoeSpaceTimeModel(nn.Module):
             ),
         )
 
-        num_render_experts = 8
-        render_feature_size = 8
+        print("Creating render layer")
         self.render_layer = MoeLayer(
             experts=nn.ModuleList([render_class() for _ in range(num_render_experts_total)]),
             gate=feature_gate(),
@@ -510,6 +549,7 @@ class MoeSpaceTimeModel(nn.Module):
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
         print("all_table_values", all_table_values.shape)
         table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
+        table_features = all_table_values
         print("table_features", table_features.shape)
         render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
         print("render_features", render_features.shape)
@@ -723,8 +763,11 @@ class SpaceTimeLookTable(nn.Module):
 # We can then pass that batch of 3D points through the model and see if we get back 4D points
 if __name__ == "__main__":
     model = get_model("moe-spacetime")
-    pos = torch.randn(100, 3)
-    dir = torch.randn(100, 3)
-    t = torch.randn(100, 1)
+    device = get_default_device()
+    model = model.to(device)
+    pos = torch.randn(100, 3).to(device)
+    dir = torch.randn(100, 3).to(device)
+    t = torch.randn(100, 1).to(device)
+    print("Calling model")
     y = model(pos, dir, t)
     print(y.shape)
