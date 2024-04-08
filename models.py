@@ -370,7 +370,7 @@ class MoeArgs(Serializable):
 
 # MoE layer to gate an arbitary set of models
 class MoeLayer(nn.Module):
-    def __init__(self, experts: List[nn.Module] = None, experts_class: nn.Module = None, gate: nn.Module = None, moe_args: MoeArgs = None, pool="sum"):
+    def __init__(self, experts: List[nn.Module] = None, expert_class: nn.Module = None, gate: nn.Module = None, moe_args: MoeArgs = None, pool="sum"):
         super().__init__()
         assert len(experts) > 0
         # assert pool is append or sum
@@ -383,9 +383,9 @@ class MoeLayer(nn.Module):
         if experts:
             self.default_experts = nn.ModuleList(experts[: moe_args.num_default_experts])
             self.specialist_experts = nn.ModuleList(experts[moe_args.num_default_experts :])
-        elif experts_class:
-            self.default_experts = nn.ModuleList([experts_class() for _ in range(moe_args.num_default_experts)])
-            self.specialist_experts = nn.ModuleList([experts_class() for _ in range(self.num_specialist_experts)])
+        elif expert_class:
+            self.default_experts = nn.ModuleList([expert_class() for _ in range(moe_args.num_default_experts)])
+            self.specialist_experts = nn.ModuleList([expert_class() for _ in range(self.num_specialist_experts)])
         self.gate = gate
         self.args = moe_args
 
