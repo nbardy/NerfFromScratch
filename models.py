@@ -372,20 +372,26 @@ class MoeArgs(Serializable):
 class MoeLayer(nn.Module):
     def __init__(self, experts: List[nn.Module] = None, expert_class: nn.Module = None, gate: nn.Module = None, moe_args: MoeArgs = None, pool="sum"):
         super().__init__()
-        assert len(experts) > 0
-        # assert pool is append or sum
+        # assert len(experts) > 0
+        # Assert that epxerts or experts class is a list or a class
+        if expert_class is not None:
+            assert callable(expert_class), f"[error] expert_class must be callable, but got type {type(expert_class)}"
+        else:
+            assert isinstance(experts, torch.nn.ModuleList), f"[error] experts must be a list, but got type {type(experts)}"
         assert pool in ["append", "sum"]
         assert gate is not None
         assert moe_args is not None
 
         self.pool_op = pool
         self.num_specialist_experts = moe_args.num_experts - moe_args.num_default_experts
+
         if experts:
             self.default_experts = nn.ModuleList(experts[: moe_args.num_default_experts])
             self.specialist_experts = nn.ModuleList(experts[moe_args.num_default_experts :])
         elif expert_class:
             self.default_experts = nn.ModuleList([expert_class() for _ in range(moe_args.num_default_experts)])
             self.specialist_experts = nn.ModuleList([expert_class() for _ in range(self.num_specialist_experts)])
+
         self.gate = gate
         self.args = moe_args
 
@@ -400,7 +406,6 @@ class MoeLayer(nn.Module):
     def forward(self, inputs: torch.Tensor, gate_inputs: torch.Tensor = None):
         print("Moe Layer forward pass")
         print("experts")
-        print("num experts:", len(self.experts))
         print("num default experts:", self.args.num_default_experts)
         print("num experts per tok:", self.args.num_experts_per_tok)
 
@@ -417,17 +422,15 @@ class MoeLayer(nn.Module):
         debug_tensor("weights", weights)
 
         # Process default experts
-        if self.args.num_default_experts > 0:
-            default_experts = self.experts[: self.args.num_default_experts]
-            for default_expert in default_experts:
-                print("calling default expert")
-                expert_result = default_expert(inputs)
-                debug_tensor("expert result", expert_result)
+        for default_expert in self.default_experts:
+            print("calling default expert")
+            expert_result = default_expert(inputs)
+            debug_tensor("expert result", expert_result)
 
-                results = self.pool(results, expert_result)
+            results = self.pool(results, expert_result)
 
         # Process selected experts
-        for i, expert in enumerate(self.experts[self.args.num_default_experts :], start=self.args.num_default_experts):
+        for i, expert in enumerate(self.specialist_experts):
             batch_idx, nth_expert = torch.where(selected_experts == i - self.args.num_default_experts)
             print("=== Index i ==== (", i, ")")
             debug_tensor("calling selected expert, expert index", torch.tensor([i]))
@@ -495,7 +498,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         self.geometric_layer = MoeLayer(
             # experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts_total)]),
-            expert_class=geo_class(),
+            expert_class=geo_class,
             gate=geo_gate(),
             moe_args=MoeArgs(
                 num_experts=num_geo_experts_total,
