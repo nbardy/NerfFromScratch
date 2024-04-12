@@ -415,11 +415,12 @@ class MoeLayer(nn.Module):
 
         debug_tensor("gate_logits", gate_logits)
         weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
+        debug_tensor("weights", weights)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = None
 
         debug_tensor("selected experts", selected_experts)
-        debug_tensor("weights", weights)
+        debug_tensor("weights(post-softmax)", weights)
 
         # Process default experts
         for default_expert in self.default_experts:
@@ -433,7 +434,7 @@ class MoeLayer(nn.Module):
         for i, expert in enumerate(self.specialist_experts):
             batch_idx, nth_expert = torch.where(selected_experts == i - self.args.num_default_experts)
             print("=== Index i ==== (", i, ")")
-            debug_tensor("calling selected expert, expert index", torch.tensor([i]))
+            debug_tensor("calling selected expert", torch.tensor([i]))
             debug_tensor("batch_idx", batch_idx)
             debug_tensor("nth_expert", nth_expert)
             debug_tensor("inputs", inputs)
@@ -492,8 +493,8 @@ class MoeSpaceTimeModel(nn.Module):
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
 
-        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_chosen, inner_activation=True, inner_bias=True)
-        table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_table_experts_chosen)
+        geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_total, inner_activation=True, inner_bias=True)
+        table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_total_tables)
         feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
         self.geometric_layer = MoeLayer(
@@ -535,7 +536,10 @@ class MoeSpaceTimeModel(nn.Module):
 
         # The original NERF paper shows benefits of having a separate color prediction based on
         # the viewing direction, we do this here as well
+        # 
+        # Retrieve opacity first
         self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
+        # We append the ray origin and the opacity
         self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
 
     def forward(self, point=None, origin=None, time=None):

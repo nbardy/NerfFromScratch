@@ -109,19 +109,13 @@ def normalize_edge_detection(tensor):
     Applies Sobel filter for edge detection and normalizes the result to a 0-1 range.
     """
 
-    print("t0", tensor.shape)
-
     # Ensure tensor is in the correct shape BxCxHxW for kornia.filters.sobel
     if tensor.dim() == 3:  # CxHxW
         tensor = tensor.unsqueeze(0)  # Add batch dimension: 1xCxHxW
     elif tensor.dim() != 4:
         raise ValueError(f"Expected tensor to be 3 or 4 dimensions, got {tensor.dim()}")
 
-    print("t1", tensor.shape)
-
     tensor = rearrange(tensor, "b h w c -> b c h w")
-
-    print("t2", tensor.shape)
 
     # Apply Sobel filter with normalization
     edge_mask = kornia.filters.sobel(tensor, normalized=True, eps=1e-6)  # 1x1xHxW
@@ -259,10 +253,10 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
     )  # [B, nb_bins]
 
     # print sizes
-    print(" ,.-*='` Ray Direction sizes `'=*-., ")
-    print("ray_directions", ray_directions.shape)
-    print("ray_origins", ray_origins.shape)
-    print("times", times.shape)
+    # print(" ,.-*='` Ray Direction sizes `'=*-., ")
+    # print("ray_directions", ray_directions.shape)
+    # print("ray_origins", ray_origins.shape)
+    # print("times", times.shape)
 
     # Compute 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
@@ -282,9 +276,9 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
     colors = colors.reshape(x.shape)
     sigma = sigma.reshape(x.shape[:-1])
 
-    print(" ,.-* NeRF model output sizes *.-,")
-    print("colors", colors.shape)
-    print("sigma", sigma.shape)
+    # print(" ,.-* NeRF model output sizes *.-,")
+    # print("colors", colors.shape)
+    # print("sigma", sigma.shape)
 
     # Compute alpha values and weights for color accumulation
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
