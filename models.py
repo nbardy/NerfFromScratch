@@ -395,7 +395,22 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.args = moe_args
 
-    def pool(self, results, batch_idx, item):
+    def pool(self, results, batch_idx, item, batch_size):
+        # Create empty tensor if results is None
+        if results is None:
+            if self.pool_op == "append":
+                # Initialize results tensor with an extra dimension of size num_experts_per_tok
+                results = torch.zeros(
+                    (item.shape[0], self.args.num_experts_per_tok, *item.shape[1:]),
+                    dtype=item.dtype,
+                    device=item.device,
+                )
+                self.current_index = torch.zeros(item.shape[0], dtype=torch.long, device=item.device)
+        else:
+            # jj
+            results_shape = (batch_size, *item.shape[1:])
+            results = torch.zeros(results_shape, dtype=item.dtype, device=item.device)
+
         if self.pool_op == "sum":
             results[batch_idx] += item
         elif self.pool_op == "append":
@@ -430,15 +445,21 @@ class MoeLayer(nn.Module):
         debug_tensor("selected experts", selected_experts)
         debug_tensor("weights(post-softmax)", weights)
 
-        batch_size = inputs.shape[0]
-
         # Process default experts
         for default_expert in self.default_experts:
             print("calling default expert")
             expert_result = default_expert(inputs)
             debug_tensor("expert result", expert_result)
 
-            results = self.pool(results, batch_idx, expert_result, batch_size)
+            if results is None:
+                output_shape = list(expert_result.shape)
+                output_shape[0] = inputs.shape[0]
+                results = torch.zeros(output_shape, dtype=expert_result.dtype, device=expert_result.device)
+
+            # set batch_idx as all
+            batch_idx = torch.arange(inputs.shape[0], device=inputs.device)
+
+            results = self.pool(results, batch_idx, expert_result, inputs.shape[0])
 
         # Process selected experts
         for i, expert in enumerate(self.specialist_experts):
@@ -448,7 +469,7 @@ class MoeLayer(nn.Module):
             debug_tensor("batch_idx", batch_idx)
             debug_tensor("nth_expert", nth_expert)
             debug_tensor("inputs", inputs)
-            results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]))
+            results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), inputs.shape[0])
 
         return results
 
