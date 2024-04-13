@@ -395,12 +395,20 @@ class MoeLayer(nn.Module):
         self.gate = gate
         self.args = moe_args
 
-    # pool the item based on append or sum
-    def pool(self, results, item):
-        if self.pool_op == "append":
-            results = [item] if results is None else results + [item]
-        elif self.pool_op == "sum":
-            results = item if results is None else results + item
+    def pool(self, results, batch_idx, item):
+        if self.pool_op == "sum":
+            results[batch_idx] += item
+        elif self.pool_op == "append":
+
+            # Get the next empty index for each batch item
+            next_index = self.current_index[batch_idx]
+
+            # Insert the item at the appropriate index
+            results[batch_idx, next_index] = item
+
+            # Increment the current_index for the updated batch items
+            self.current_index[batch_idx] += 1
+
         return results
 
     def forward(self, inputs: torch.Tensor, gate_inputs: torch.Tensor = None):
@@ -422,13 +430,15 @@ class MoeLayer(nn.Module):
         debug_tensor("selected experts", selected_experts)
         debug_tensor("weights(post-softmax)", weights)
 
+        batch_size = inputs.shape[0]
+
         # Process default experts
         for default_expert in self.default_experts:
             print("calling default expert")
             expert_result = default_expert(inputs)
             debug_tensor("expert result", expert_result)
 
-            results = self.pool(results, expert_result)
+            results = self.pool(results, batch_idx, expert_result, batch_size)
 
         # Process selected experts
         for i, expert in enumerate(self.specialist_experts):
@@ -438,7 +448,7 @@ class MoeLayer(nn.Module):
             debug_tensor("batch_idx", batch_idx)
             debug_tensor("nth_expert", nth_expert)
             debug_tensor("inputs", inputs)
-            results = self.pool(results, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]))
+            results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), batch_size)
 
         return results
 
@@ -512,7 +522,8 @@ class MoeSpaceTimeModel(nn.Module):
 
         self.table_moe = MoeLayer(
             experts=nn.ModuleList([table_class() for _ in range(num_total_tables)]),
-            pool="append",
+            # pool="append", # TOOD:Implimente
+            pool="sum",
             gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_active_tables,
@@ -536,10 +547,10 @@ class MoeSpaceTimeModel(nn.Module):
 
         # The original NERF paper shows benefits of having a separate color prediction based on
         # the viewing direction, we do this here as well
-        # 
+        #
         # Retrieve opacity first
         self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
-        # We append the ray origin and the opacity
+        # We append the ray origin and the opacity to the original feature and compute color separately
         self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
 
     def forward(self, point=None, origin=None, time=None):

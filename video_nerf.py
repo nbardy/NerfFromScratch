@@ -129,13 +129,11 @@ def normalize_edge_detection(tensor):
 
 def sample_indices(prob_dist, n_samples, total_pixels):
     # Flatten the probability distribution
-    print(prob_dist.shape)
     prob_dist_flat = prob_dist.view(-1)
     # Debug: Print min and max of the probability distribution
-    print("N_samples", n_samples)
-    # prod dist size
-    print("prob_dist_flat", prob_dist_flat.shape)
-    print(f"Min prob: {prob_dist_flat.min()}, Max prob: {prob_dist_flat.max()}")
+    # print(prob_dist.shape)
+    # print("N_samples", n_samples)
+    # debug_tensor("prob_dist_flat", prob_dist_flat)
     # Sample indices based on the probability distribution without replacement
     indices = torch.multinomial(prob_dist_flat, n_samples, replacement=False)
     return indices
@@ -164,7 +162,7 @@ def sample_n_points_from_tensors(
         # Generate probability distribution for uniform sampling
         # Uniform probability distribution for uniform sampling
         uniform_prob_dist = torch.full((total_pixels,), 1.0 / total_pixels, device=image_tensors[0].device)  # total_pixels
-        print("uniform_prob_dist shape:", uniform_prob_dist.shape)  # Debug print
+        # print("uniform_prob_dist shape:", uniform_prob_dist.shape)  # Debug print
         uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)  # n_uniform
 
         # Compute mean edge weights for edge and blurred edge masks
@@ -179,8 +177,8 @@ def sample_n_points_from_tensors(
         edge_prob_dist = edge_weights.repeat_interleave(total_pixels // edge_weights.size(0))  # total_pixels
         blurred_edge_prob_dist = blurred_edge_weights.repeat_interleave(total_pixels // blurred_edge_weights.size(0))  # total_pixels
 
-        print("edge_prob_dist shape:", edge_prob_dist.shape)  # Debug print
-        print("blurred_edge_prob_dist shape:", blurred_edge_prob_dist.shape)  # Debug print
+        # print("edge_prob_dist shape:", edge_prob_dist.shape)  # Debug print
+        # print("blurred_edge_prob_dist shape:", blurred_edge_prob_dist.shape)  # Debug print
         # Weighted sampling for edge and blurred edge based on normalized weights
         edge_indices = sample_indices(edge_prob_dist, n_edge, total_pixels)  # n_edge
         blurred_edge_indices = sample_indices(blurred_edge_prob_dist, n_blurred_edge, total_pixels)  # n_blurred_edge
@@ -599,6 +597,7 @@ def train_video(
     depth_maps = video_depth(video_frames, cache_dir="cache", filename=video_path)
 
     for epoch in range(epochs):
+        print("Epoch 1")
         sampled_frames, sampled_indices = sample_video_frames_by_args(
             video_frames,
             n_frames=n_frames,
