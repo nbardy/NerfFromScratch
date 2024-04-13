@@ -1,8 +1,11 @@
 import torch
 
+should_debug = False
+
 
 def debug_tensor(name, tensor):
-    print(f"{name:<20} min: {tensor.min():<10}, max: {tensor.max():<10}, shape: {tensor.shape}")
+    if should_debug:
+        print(f"{name:<20} min: {tensor.min():<10}, max: {tensor.max():<10}, shape: {tensor.shape}")
 
 
 def get_default_device():

@@ -448,7 +448,7 @@ class MoeLayer(nn.Module):
             debug_tensor("batch_idx", batch_idx)
             debug_tensor("nth_expert", nth_expert)
             debug_tensor("inputs", inputs)
-            results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), batch_size)
+            results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]))
 
         return results
 
