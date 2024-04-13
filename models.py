@@ -369,6 +369,8 @@ class MoeArgs(Serializable):
 
 
 # MoE layer to gate an arbitary set of models
+#
+# Supported multiples experts, deafaults, and two types of expert pooling: sum and append
 class MoeLayer(nn.Module):
     def __init__(self, experts: List[nn.Module] = None, expert_class: nn.Module = None, gate: nn.Module = None, moe_args: MoeArgs = None, pool="sum"):
         super().__init__()
