@@ -62,26 +62,25 @@ class FlashGQAAttention(nn.Module):
 class SphericalEmbedding(nn.Module):
     def __init__(self, dim=8, depth=8):
         super(SphericalEmbedding, self).__init__()
-        self.projection_dim = dim
-        self.depth_dim = depth
-        # Initialize a center point for each projection dimension, resulting in D x 3
-        self.centers = nn.Parameter(torch.randn(depth, 3))  # D x 3
-        # Corrected the shape of the random projection matrix to match the expected output dimensions
-        self.random_projection = nn.Parameter(torch.randn(depth, 3, dim))  # D x 3 x P
+        # fmt: off
+        self.projection_dim     = dim
+        self.depth_dim          = depth
+        self.centers            = nn.Parameter(torch.randn(depth, 3))  # Initialize center points, D x 3
+        self.random_projection  = nn.Parameter(torch.randn(depth, 3, dim))  # Random projection matrix, D x 3 x P
 
     def forward(self, x):
         assert x.shape[-1] == 3, "Input must be Bx3"
         assert len(x.shape) == 2, "Input must be a 2D tensor"
 
-        x_expanded = x[:, None, :] - self.centers[None, :, :]  # B x D x 3
+        x_expanded = x[:, None, :] - self.centers[None, :, :]  # Expand and center, B x D x 3
 
-        rho = torch.sqrt(torch.sum(x_expanded**2, dim=-1, keepdim=True))  # B x D x 1
-        phi = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])  # B x D
-        theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))  # B x D
+        # fmt: off
+        rho   = torch.sqrt(torch.sum(x_expanded**2, dim=-1, keepdim=True))  # Radius, B x D x 1
+        phi   = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])  # Azimuth angle, B x D
+        theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))  # Polar angle, B x D
 
-        spherical_coords = torch.stack([rho.squeeze(-1), phi, theta], dim=-1)  # B x D x 3
-        # Corrected matrix multiplication to account for depth dimension in random_projection
-        projected = torch.einsum("bdi,dij->bdj", spherical_coords, self.random_projection)  # B x D x P
+        spherical_coords = torch.stack([rho.squeeze(-1), phi, theta], dim=-1)  # Stack to spherical coordinates, B x D x 3
+        projected        = torch.einsum("bdi,dij->bdj", spherical_coords, self.random_projection)  # Project to embedding, B x D x P
 
         return projected
 
@@ -100,9 +99,8 @@ class AngleEmbedding(nn.Module):
         sin_x       = torch.sin(x)  # BxI
         cos_x       = torch.cos(x)  # BxI
         x_augmented = torch.cat([sin_x, cos_x], dim=-1)  # Bx(2*I)
-        x_augmented = x_augmented.unsqueeze(1).expand(-1, self.depth, -1)  # BxDx(2*I)
-        # Adjusted to perform depth-wise matrix multiplication
-        projected = torch.einsum("bdi,dij->bdj", x_augmented, self.random_projection)  # BxDxP
+        x_augmented = x_augmented.unsqueeze(1).expand(-1, self.depth, -1)  # BxDx(2*I), expanded to match depth
+        projected   = torch.bmm(x_augmented, self.random_projection)  # BxDxP
         return projected
 
 
@@ -205,13 +203,25 @@ def test_tiny_spherical_transformer():
 
 # Spherical embedding test should check that we go from BxInput Dim size to BxP size
 def test_spherical_embedding():
-    model = SphericalEmbedding(dim=8)
+    model = SphericalEmbedding(dim=8, depth=8)
     x = torch.randn(10, 3)  # Bx3
     out = model(x)
-    assert out.shape == (10, 8)  # Updated to match the corrected output shape
+
+    debug_str = f"out shape: {out.shape}"
+    print(debug_str)
+    assert out.shape == (10, 8, 8), debug_str
 
 
-# on main run tests
+def test_angle_embedding():
+    model = AngleEmbedding(input_dim=1, projection_dim=8, depth=8)
+    x = torch.randn(10, 1)  # Bx1
+    out = model(x)
+
+    debug_str = f"out shape: {out.shape}"
+    print(debug_str)
+    assert out.shape == (10, 8, 8), debug_str
+
+
 if __name__ == "__main__":
     test_spherical_embedding()
     test_tiny_spherical_transformer()
