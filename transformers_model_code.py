@@ -25,38 +25,25 @@ class GEGLU(nn.Module):
 
 
 class FlashGQAAttention(nn.Module):
-    def __init__(self, dim, heads=8, qk_dim=64, v_dim=8):
+    def __init__(self, dim, heads=8, dropout=0.0, bias=True):
         super().__init__()
         self.heads = heads
-        self.scale = qk_dim**-0.5
+        self.dim = dim
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, bias=bias, batch_first=True)
 
-        self.to_qkv = nn.Linear(dim, qk_dim * 2 + v_dim, bias=False)  # Combined QKV projection
-        self.to_out = nn.Linear(v_dim * heads, dim, bias=False)
+        self.to_out = nn.Linear(dim, dim, bias=False)  # Projection for output
 
-    def forward(self, x, qk_dim=64, v_dim=8):
-        b, n, _ = x.shape
-        qkv = self.to_qkv(x)
-        q, k, v = qkv.split([self.heads * qk_dim, self.heads * qk_dim, self.heads * v_dim], dim=-1)
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), (q, k, v))
+    def forward(self, x):
+        # x: batch_size x seq_len x embed_dim
+        assert_shape(x, (None, None, self.dim))  # Check input shape
 
-        attn = torch.nn.functional.multi_head_attention_forward(
-            query=q,
-            key=k,
-            value=v,
-            embed_dim_to_check=qk_dim * self.heads,
-            num_heads=self.heads,
-            scale_factor=self.scale,
-            q_proj_weight=None,
-            k_proj_weight=None,
-            v_proj_weight=None,
-            static_k=None,
-            static_v=None,
-        )[
-            0
-        ]  # Extracting the output tensor from the returned tuple
+        # MultiheadAttention expects input as (batch_size, seq_len, embed_dim) when batch_first=True
+        attn_output, _ = self.multihead_attn(x, x, x)  # self-attention, query=key=value
 
-        out = rearrange(attn, "b h n d -> b n (h d)")
-        return self.to_out(out)
+        # Linear projection on output
+        out = self.to_out(attn_output)  # batch_size x seq_len x embed_dim
+
+        return out
 
 
 class SphericalEmbedding(nn.Module):
@@ -95,12 +82,12 @@ class AngleEmbedding(nn.Module):
         self.random_projection = nn.Parameter(torch.randn(depth, input_dim * 2, projection_dim))  # Dx(2*I)xP
 
     def forward(self, x):
-        # fmt: off
-        sin_x       = torch.sin(x)  # BxI
-        cos_x       = torch.cos(x)  # BxI
+        sin_x = torch.sin(x)  # BxI
+        cos_x = torch.cos(x)  # BxI
         x_augmented = torch.cat([sin_x, cos_x], dim=-1)  # Bx(2*I)
         x_augmented = x_augmented.unsqueeze(1).expand(-1, self.depth, -1)  # BxDx(2*I), expanded to match depth
-        projected   = torch.bmm(x_augmented, self.random_projection)  # BxDxP
+
+        projected = torch.einsum("bdi,dij->bdj", x_augmented, self.random_projection)  # Project to embedding, BxDxP
         return projected
 
 
@@ -115,6 +102,8 @@ class TransformerBlock(nn.Module):
         self.norm2     = nn.LayerNorm(dim)
 
     def forward(self, x):
+        print("transformer input size", x.shape)
+
         x = x + self.attention(self.norm1(x))  # BxDxP after attention and residual connection
         x = x + self.ff(self.norm2(x))  # BxDxP after feedforward and residual connection
         return x
