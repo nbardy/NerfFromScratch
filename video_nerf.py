@@ -555,6 +555,10 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
     return sampled_frames, indices
 
 
+from utils import tensor_debugger
+
+
+@tensor_debugger
 def train_video(
     video_path,
     epochs=5,

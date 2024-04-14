@@ -117,14 +117,17 @@ class MultiPathGaussianMLP(nn.Module):
 
 
 class LearnableLookupTable(nn.Module):
-    def __init__(self, dims, feature_size):
+    def __init__(self, input_dim=None, index_width=None, feature_size=None):
         super(LearnableLookupTable, self).__init__()
-        self.dims = dims
-        self.table = nn.Parameter(torch.randn(*dims, feature_size))
+        # Dims should be (index_width repeated input_dim times)
+        self.dims = (index_width,) * input_dim
+        self.table = nn.Parameter(torch.randn(*self.dims, feature_size))
 
     # Scales indices from 0-1 range to table cell range
     def scale_indices(self, indices):
-        scaled_indices = (indices * (torch.tensor(self.dims, device=indices.device).float() - 1)).long()
+        # Scale indices to 0-1 range and then scale to integer values in the range [0, index_width]
+        scaled_indices = (indices * torch.tensor(self.dims, device=indices.device).float()).long()
+        debug_tensor("scaled_indices", scaled_indices)
         return scaled_indices
 
     def forward_without_scale(self, indices):
@@ -466,11 +469,11 @@ class MoeLayer(nn.Module):
         # Process selected experts
         for i, expert in enumerate(self.specialist_experts):
             batch_idx, nth_expert = torch.where(selected_experts == i - self.args.num_default_experts)
-            print("=== Index i ==== (", i, ")")
-            debug_tensor("calling selected expert", torch.tensor([i]))
-            debug_tensor("batch_idx", batch_idx)
-            debug_tensor("nth_expert", nth_expert)
-            debug_tensor("inputs", inputs)
+            # print("=== Index i ==== (", i, ")")
+            # debug_tensor("calling selected expert", torch.tensor([i]))
+            # debug_tensor("batch_idx", batch_idx)
+            # debug_tensor("nth_expert", nth_expert)
+            # debug_tensor("inputs", inputs)
             results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), inputs.shape[0])
 
         return results
@@ -498,7 +501,8 @@ class MoeSpaceTimeModel(nn.Module):
         # num_table_experts_chosen = 2
 
         # test smaller
-        table_size = (8, 8)
+        table_width = 8
+
         table_feature_size = 8
         num_total_tables = 8
         num_table_default_experts = 1
@@ -522,7 +526,7 @@ class MoeSpaceTimeModel(nn.Module):
             if use_attention_render
             else SegGLUMLP(depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
         )
-        table_class = lambda: LearnableLookupTable(table_size, table_feature_size)
+        table_class = lambda: LearnableLookupTable(input_dim=4, index_width=table_width, feature_size=table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
 
@@ -604,7 +608,6 @@ class MoeSpaceTimeModel(nn.Module):
         # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
         print("all_table_values", all_table_values.shape)
-        table_features = torch.cat(all_table_values, dim=-1)  # Concatenate table features
         table_features = all_table_values
         print("table_features", table_features.shape)
         render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)

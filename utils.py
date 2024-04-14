@@ -1,6 +1,8 @@
 import torch
+import functools
+import traceback
 
-should_debug = False
+should_debug = True
 
 
 def debug_tensor(name, tensor):
@@ -22,3 +24,39 @@ def get_default_device():
 
     print(f"Using device: {device}")
     return device
+
+
+#
+
+
+def tensor_debugger(func):
+    """
+    A decorator that wraps the passed in function and prints the names and shapes
+    of tensor variables if an exception occurs.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"Exception occurred in {func.__name__}: {e}")
+            print("Inspecting local variables for tensors...")
+            # Inspect the local variables in the traceback for tensors
+            tb = traceback.extract_tb(e.__traceback__)
+            # Get the last frame of the traceback
+            filename, lineno, function, text = tb[-1]
+            print(f"Error location: {filename}:{lineno} in {function}")
+            print(f"Statement: {text}")
+            # Access the frame at the point of the exception
+            frame = e.__traceback__.tb_frame
+            while frame:
+                local_variables = frame.f_locals
+                for var_name, value in local_variables.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"Tensor Variable: {var_name}, Shape: {value.shape}")
+                frame = frame.f_back
+            # Re-raise the exception after printing tensor info
+            raise
+
+    return wrapper
