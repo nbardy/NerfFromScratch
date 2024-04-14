@@ -25,25 +25,32 @@ class GEGLU(nn.Module):
 
 
 class FlashGQAAttention(nn.Module):
-    def __init__(self, dim, heads=8, dropout=0.0, bias=True):
+    def __init__(self, dim, heads=8, qk_dim=64, v_dim=8):
         super().__init__()
         self.heads = heads
-        self.dim = dim
-        self.multihead_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, bias=bias, batch_first=True)
+        self.scale = qk_dim**-0.5
+        self.qk_dim = qk_dim
+        self.v_dim = v_dim
 
-        self.to_out = nn.Linear(dim, dim, bias=False)  # Projection for output
+        self.to_qkv = nn.Linear(dim, qk_dim * 2 + v_dim, bias=False)  # Combined QKV projection
+        self.to_out = nn.Linear(v_dim * heads, dim, bias=False)
 
     def forward(self, x):
-        # x: batch_size x seq_len x embed_dim
-        assert_shape(x, (None, None, self.dim))  # Check input shape
+        b, n, _ = x.shape
+        qkv = self.to_qkv(x)
 
-        # MultiheadAttention expects input as (batch_size, seq_len, embed_dim) when batch_first=True
-        attn_output, _ = self.multihead_attn(x, x, x)  # self-attention, query=key=value
+        # Splitting qkv into q, k, v
+        q, k, v = qkv.split([self.heads * self.qk_dim, self.heads * self.qk_dim, self.heads * self.v_dim], dim=-1)
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), (q, k, v))
 
-        # Linear projection on output
-        out = self.to_out(attn_output)  # batch_size x seq_len x embed_dim
+        # Using flash attention for the attention mechanism
+        from flash_attn import flash_attn_func
 
-        return out
+        attn = flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=self.scale, causal=False, window_size=(-1, -1), alibi_slopes=None, deterministic=False)
+
+        # Rearranging the output to match expected dimensions
+        out = rearrange(attn, "b h n d -> b n (h d)")
+        return self.to_out(out)
 
 
 class SphericalEmbedding(nn.Module):
