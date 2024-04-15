@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from einops import rearrange
-from attention import Attention
+from attention import SelfAttention
 
 # F torch
 from torch.nn import functional as F
@@ -72,10 +72,10 @@ class AngleEmbedding(nn.Module):
 
 class TransformerBlock(nn.Module):
     # https://arxiv.org/abs/2212.14034
-    def __init__(self, dim, heads, attn_bias=False, ff_bias=False):
+    def __init__(self, dim, heads, attn_bias=False, ff_bias=True):
         super().__init__()
 
-        self.attention = Attention(hidden_size=dim, num_heads=heads, num_key_value_heads=8, bias=attn_bias)  # Adjusted to match Attention class constructor
+        self.attention = SelfAttention(bias=attn_bias, heads=heads, embed_dim=dim)  # Migrated to use SelfAttention
         # fmt: off
         self.ff        = nn.Sequential(nn.Linear(dim, dim * 2, bias=ff_bias), GEGLU(), nn.Linear(dim * 2, dim, bias=ff_bias))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
         self.norm1     = nn.LayerNorm(dim)
