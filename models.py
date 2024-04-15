@@ -403,27 +403,22 @@ class MoeLayer(nn.Module):
     def pool(self, results, batch_idx, item, batch_size):
         # Create empty tensor if results is None
         if results is None:
+            results = torch.zeros(
+                (item.shape[0], self.args.num_experts_per_tok, *item.shape[1:]),
+                dtype=item.dtype,
+                device=item.device,
+            )
+
             if self.pool_op == "append":
-                # Initialize results tensor with an extra dimension of size num_experts_per_tok
-                results = torch.zeros(
-                    (item.shape[0], self.args.num_experts_per_tok, *item.shape[1:]),
-                    dtype=item.dtype,
-                    device=item.device,
-                )
                 self.current_index = torch.zeros(item.shape[0], dtype=torch.long, device=item.device)
         else:
-            # jj
             results_shape = (batch_size, *item.shape[1:])
             results = torch.zeros(results_shape, dtype=item.dtype, device=item.device)
 
         if self.pool_op == "sum":
             results[batch_idx] += item
         elif self.pool_op == "append":
-
-            # Get the next empty index for each batch item
             next_index = self.current_index[batch_idx]
-
-            # Insert the item at the appropriate index
             results[batch_idx, next_index] = item
 
             # Increment the current_index for the updated batch items
@@ -455,11 +450,6 @@ class MoeLayer(nn.Module):
             print("calling default expert")
             expert_result = default_expert(inputs)
             debug_tensor("expert result", expert_result)
-
-            if results is None:
-                output_shape = list(expert_result.shape)
-                output_shape[0] = inputs.shape[0]
-                results = torch.zeros(output_shape, dtype=expert_result.dtype, device=expert_result.device)
 
             # set batch_idx as all
             batch_idx = torch.arange(inputs.shape[0], device=inputs.device)
@@ -549,8 +539,8 @@ class MoeSpaceTimeModel(nn.Module):
 
         self.table_moe = MoeLayer(
             experts=nn.ModuleList([table_class() for _ in range(num_total_tables)]),
-            # pool="append", # TOOD:Implimente
-            pool="sum",
+            pool="append",  # TOOD:Implimente
+            # pool="sum",
             gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_active_tables,
@@ -822,6 +812,7 @@ class SpaceTimeLookTable(nn.Module):
 # We can then pass that batch of 3D points through the model and see if we get back 4D points
 if __name__ == "__main__":
     model = get_model("moe-spacetime")
+
     device = get_default_device()
     model = model.to(device)
     pos = torch.randn(100, 3).to(device)

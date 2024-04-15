@@ -58,16 +58,26 @@ class AngleEmbedding(nn.Module):
         self.input_dim = input_dim
         self.depth = depth
         # Adjusted to create a depth-wise projection matrix
-        self.random_projection = nn.Parameter(torch.randn(depth, input_dim * 2, projection_dim))  # Dx(2*I)xP
+        # We make two matrices to project from BxIx2 to BxDxP in 2 steps:
+        #  1. Project from BxIx2 to BxIxD
+        #  2. Project from BxIxD to BxDxP
+        self.linear_layer_1 = nn.Linear(2, depth, bias=False)  # Linear layer for BxIx2 to BxIxD
+        self.linear_layer_2 = nn.Linear(self.input_dim, self.projection_dim, bias=False)  # Linear layer for BxIxD to BxDxP
 
     def forward(self, x):
         sin_x = torch.sin(x)  # BxI
         cos_x = torch.cos(x)  # BxI
-        x_augmented = torch.cat([sin_x, cos_x], dim=-1)  # Bx(2*I)
-        x_augmented = x_augmented.unsqueeze(1).expand(-1, self.depth, -1)  # BxDx(2*I), expanded to match depth
+        x_augmented = torch.stack([sin_x, cos_x], dim=-1)  # BxIx2
 
-        projected = torch.einsum("bdi,dij->bdj", x_augmented, self.random_projection)  # Project to embedding, BxDxP
-        return projected
+        # First projection from BxIx2 to BxIxD
+        print("x_augmented shape", x_augmented.shape)
+        p = self.linear_layer_1(x_augmented)  # BxIxD
+        print("(pre) p", p.shape)
+        p = rearrange(p, "b i d -> b d i")
+        print("(post) p", p.shape)
+        p = self.linear_layer_2(p)  # BxDxP
+
+        return p
 
 
 class TransformerBlock(nn.Module):
@@ -137,12 +147,18 @@ class TransformerEncoder(nn.Module):
         heads = 8
         model_depth = 1
 
+        self.input_dim = input_dim
+
         # fmt: off
         self.embedding          = AngleEmbedding(input_dim, projection_dim=projection_dim, depth=embedding_depth)
         self.transformer_blocks = nn.ModuleList([TransformerBlock(projection_dim, heads) for _ in range(model_depth)])
         self.final_projection   = nn.Linear(projection_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
 
     def forward(self, x):
+        print("====")
+        print("input_size", self.input_dim)
+        print("transformer input size", x.shape)
+        print("====")
         x = self.embedding(x)
 
         for block in self.transformer_blocks:
@@ -191,5 +207,6 @@ def test_angle_embedding():
 
 if __name__ == "__main__":
     test_spherical_embedding()
+    test_angle_embedding()
     test_tiny_spherical_transformer()
     test_space_time_encoder()
