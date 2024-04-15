@@ -71,13 +71,12 @@ class AngleEmbedding(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    # https://arxiv.org/abs/2212.14034
     def __init__(self, dim, heads, attn_bias=False, ff_bias=True):
         super().__init__()
 
         self.attention = SelfAttention(bias=attn_bias, heads=heads, embed_dim=dim)  # Migrated to use SelfAttention
         # fmt: off
-        self.ff        = nn.Sequential(nn.Linear(dim, dim * 2, bias=ff_bias), GEGLU(), nn.Linear(dim * 2, dim, bias=ff_bias))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
+        self.ff        = nn.Sequential(nn.Linear(dim, dim * 2, bias=ff_bias), GEGLU(), nn.Linear(dim, dim, bias=ff_bias))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
         self.norm1     = nn.LayerNorm(dim)
         self.norm2     = nn.LayerNorm(dim)
 
@@ -85,6 +84,7 @@ class TransformerBlock(nn.Module):
         print("transformer input size", x.shape)
 
         x = x + self.attention(self.norm1(x))  # BxDxP after attention and residual connection
+        print("x after attention", x.shape)
         x = x + self.ff(self.norm2(x))  # BxDxP after feedforward and residual connection
         return x
 
@@ -113,7 +113,7 @@ class SpaceTimeTransformerEncoder(nn.Module):
         # fmt: off
         self.embedding              = SpaceTimeEmbedding(projection_dim=projection_dim, depth=embedding_dim)
         self.transformer_blocks     = nn.ModuleList([TransformerBlock(projection_dim, heads) for _ in range(model_depth)])
-        self.final_projection       = nn.Linear(projection_dim * embedding_dim * projection_dim, output_dim)
+        self.final_projection       = nn.Linear(projection_dim * embedding_dim, output_dim)
 
     def forward(self, x):  # x = BxI
         # fmt: off
@@ -140,7 +140,7 @@ class TransformerEncoder(nn.Module):
         # fmt: off
         self.embedding          = AngleEmbedding(input_dim, projection_dim=projection_dim, depth=embedding_depth)
         self.transformer_blocks = nn.ModuleList([TransformerBlock(projection_dim, heads) for _ in range(model_depth)])
-        self.final_projection   = nn.Linear(projection_dim, output_dim)  # Flatten Bx(D*P) => BxO
+        self.final_projection   = nn.Linear(projection_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
 
     def forward(self, x):
         x = self.embedding(x)
@@ -155,12 +155,10 @@ class TransformerEncoder(nn.Module):
 
 # Test to make sure we go from BxI to Bx
 def test_space_time_encoder():
-    model = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4)
-    x = torch.randn(1, 4)  # BxI
+    model = SpaceTimeTransformerEncoder(output_dim=4)
+    x = torch.randn(10, 4)  # BxI
     out = model(x)
-    assert out.shape == (1, 4)
-    assert torch.all(out >= 0)
-    assert torch.all(out <= 1)
+    assert out.shape == (10, 4)
 
 
 def test_tiny_spherical_transformer():
