@@ -72,12 +72,12 @@ class AngleEmbedding(nn.Module):
 
 class TransformerBlock(nn.Module):
     # https://arxiv.org/abs/2212.14034
-    def __init__(self, dim, heads, bias=True):
+    def __init__(self, dim, heads, attn_bias=False, ff_bias=False):
         super().__init__()
 
-        self.attention = Attention(dim=dim, heads=heads, qk_dim=64, v_dim=8)  # Attention on D dimension
+        self.attention = Attention(hidden_size=dim, num_heads=heads, num_key_value_heads=8, bias=attn_bias)  # Adjusted to match Attention class constructor
         # fmt: off
-        self.ff        = nn.Sequential(nn.Linear(dim, dim * 2, bias=bias), GEGLU(), nn.Linear(dim * 2, dim, bias=bias))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
+        self.ff        = nn.Sequential(nn.Linear(dim, dim * 2, bias=ff_bias), GEGLU(), nn.Linear(dim * 2, dim, bias=ff_bias))  # BxDx(2*P)  # BxDx(2*P)  # BxDxP
         self.norm1     = nn.LayerNorm(dim)
         self.norm2     = nn.LayerNorm(dim)
 
