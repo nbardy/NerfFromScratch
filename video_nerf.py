@@ -197,7 +197,7 @@ def sample_n_points_from_tensors(
         # Sample colors from tensor using the generated indices
         sampled_tensor_values = tensor[y_coords, x_coords, :]  # CxN
         # Move the batch to the last dim
-        # sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
+        sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
         sampled_values.append(sampled_tensor_values)
 
     return sampled_values
@@ -571,6 +571,7 @@ def train_video(
 
     device = get_default_device()
     video_frames = load_video(video_path, max_frames=max_frames)
+    videos_frames = rearrange(video_frames, "f w h c -> f c w h")
 
     camera_position = LearnableCameraPosition(n_frames=len(video_frames))
     scene_function = get_model(args.model)
@@ -616,10 +617,12 @@ def train_video(
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            # print("frame", frame.shape)
-            # print("camera_poses", camera_poses.shape)
-            # print("camera_rays", camera_rays.shape)
-            # print("frame_depth_estimate", frame_depth_estimate.shape)
+            print("== Sampled ==")
+            print("frame", frame.shape)
+            print("camera_poses", camera_poses.shape)
+            print("camera_rays", camera_rays.shape)
+            print("frame_depth_estimate", frame_depth_estimate.shape)
+
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
                 [frame, camera_poses, camera_rays, frame_depth_estimate],
                 n_points,
