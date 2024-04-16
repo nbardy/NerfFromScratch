@@ -65,16 +65,18 @@ class AngleEmbedding(nn.Module):
         self.linear_layer_2 = nn.Linear(self.input_dim, self.projection_dim, bias=False)  # Linear layer for BxIxD to BxDxP
 
     def forward(self, x):
+        # print("== angle embed ==")
+        # print("angle embedding x", x.shape)
         sin_x = torch.sin(x)  # BxI
         cos_x = torch.cos(x)  # BxI
         x_augmented = torch.stack([sin_x, cos_x], dim=-1)  # BxIx2
 
         # First projection from BxIx2 to BxIxD
-        print("x_augmented shape", x_augmented.shape)
         p = self.linear_layer_1(x_augmented)  # BxIxD
-        print("(pre) p", p.shape)
         p = rearrange(p, "b i d -> b d i")
-        print("(post) p", p.shape)
+        # print("(post) p", p.shape)
+        # print expect size
+        # print("expect size", [x.shape[0], self.depth, self.projection_dim])
         p = self.linear_layer_2(p)  # BxDxP
 
         return p
@@ -94,7 +96,6 @@ class TransformerBlock(nn.Module):
         print("transformer input size", x.shape)
 
         x = x + self.attention(self.norm1(x))  # BxDxP after attention and residual connection
-        print("x after attention", x.shape)
         x = x + self.ff(self.norm2(x))  # BxDxP after feedforward and residual connection
         return x
 
@@ -155,10 +156,10 @@ class TransformerEncoder(nn.Module):
         self.final_projection   = nn.Linear(projection_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
 
     def forward(self, x):
-        print("====")
-        print("input_size", self.input_dim)
-        print("transformer input size", x.shape)
-        print("====")
+        # print("====")
+        # print("input_size", self.input_dim)
+        # print("transformer input size", x.shape)
+        # print("====")
         x = self.embedding(x)
 
         for block in self.transformer_blocks:

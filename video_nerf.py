@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import wandb
 from PIL import Image
-from einops import rearrange
 import torch.nn.functional as F
 import numpy as np
 import kornia
@@ -196,9 +195,9 @@ def sample_n_points_from_tensors(
 
     for tensor in image_tensors:
         # Sample colors from tensor using the generated indices
-        sampled_tensor_values = tensor[:, y_coords, x_coords]  # CxN
+        sampled_tensor_values = tensor[y_coords, x_coords, :]  # CxN
         # Move the batch to the last dim
-        sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
+        # sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
         sampled_values.append(sampled_tensor_values)
 
     return sampled_values
@@ -217,23 +216,9 @@ def transmittance(alphas):
     )
 
 
-def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_samples, args=None):
-    # all sizes pretty print debug
-    print(" ,.-* Input sizes *.-,")
-    print("ray_origins", ray_origins.shape)
-    print("ray_directions", ray_directions.shape)
-    print("times", times.shape)
-
+def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb_bins=192, args=None):
     device = ray_origins.device
-    nb_bins = num_samples
-    T = args.entropy_threshold if args.enable_entropy_loss else 0.1
 
-    near = torch.tensor(near, device=device)
-    far = torch.tensor(far, device=device)
-
-    # Sample points along each ray
-    hn = near
-    hf = far
     t = torch.linspace(hn, hf, steps=nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)  # Bxnb_bins
     # Perturb sampling along each ray for stochastic sampling
     mid = (t[:, :-1] + t[:, 1:]) / 2.0  # Midpoints for perturbation
@@ -250,16 +235,18 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
         dim=-1,
     )  # [B, nb_bins]
 
-    # print sizes
-    # print(" ,.-*='` Ray Direction sizes `'=*-., ")
-    # print("ray_directions", ray_directions.shape)
-    # print("ray_origins", ray_origins.shape)
-    # print("times", times.shape)
-
     # Compute 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
-    # ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
+    print("==== Notice ====")
+    print("Shape ray_origins: ", ray_origins.shape)
+    print("Shape ray_directions: ", ray_directions.shape)
+    print("Shape x: ", x.shape)
+    print("Shape t: ", t.shape)
+    print("nb_bins: ", nb_bins)
+    print("================")
+
+    ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
 
     ray_origins = repeat(ray_origins, "b c -> b nb_bins c", nb_bins=nb_bins)  # Bxnb_binsx3
     times = repeat(times, "b 1 -> b nb_bins", nb_bins=nb_bins)  # Bxnb_bins
@@ -270,16 +257,18 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
     flat_origin = rearrange(ray_origins, "b nb_bins c -> (b nb_bins) c")  # B*nb_binsx3
 
     # Query NeRF model for colors and densities
-    colors, sigma = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
-    colors = colors.reshape(x.shape)
-    sigma = sigma.reshape(x.shape[:-1])
-
-    # print(" ,.-* NeRF model output sizes *.-,")
-    # print("colors", colors.shape)
-    # print("sigma", sigma.shape)
+    rgba = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
+    colors = rgba[:, :3]
+    sigma = rgba[:, 3]
 
     # Compute alpha values and weights for color accumulation
+    print("shapes", colors.shape, sigma.shape, delta.shape)
+    colors = colors.reshape(x.shape)
+    sigma = sigma.reshape(x.shape[:-1])
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
+    if args.use_noise:
+        alpha = alpha + torch.randn(alpha.shape, device=alpha.device)
+
     weights = transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
 
     # Compute probability distribution for entropy regularization
@@ -288,6 +277,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
     # on empty space
     if args.enable_entropy_loss:
         prob = alpha / (alpha.sum(1).unsqueeze(1) + 1e-10)
+        T = args.entropy_threshold
         mask = alpha.sum(1).unsqueeze(1) > T
         regularization = -1 * prob * torch.log2(prob + 1e-10)
         regularization = (regularization * mask).sum(1).mean()
@@ -295,13 +285,18 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, near, far, num_s
         regularization = 0.0
 
     # Accumulate colors along rays
-    c = (weights * colors).sum(dim=1)  # Pixel values
+    print("weights", weights.shape)  # Debugging shape of weights
+    print("colors", colors.shape)  # Debugging shape of colors
+    print("t", t.shape)  # Debugging shape of t
+    c = (weights * colors).sum(dim=1)  # Accumulate weighted colors along rays to compute pixel values
+    # Fixing depth calculation by ensuring weights are broadcasted correctly for element-wise multiplication with t
+    depth = (weights.squeeze(-1) * t).sum(dim=1)  # Accumulate weighted depths along rays
+
     # Regularization for white background
     weight_sum = weights.sum(-1).sum(-1)
+    disp = 1.0 / torch.max(1e-10 * torch.ones_like(depth), depth / weight_sum)
 
-    depth = (t * weights).sum(dim=1)
-
-    return c + 1 - weight_sum.unsqueeze(-1), regularization, depth
+    return c, regularization, depth, disp
 
 
 def compute_style_loss(batch_output, depth, args):
@@ -317,7 +312,6 @@ def compute_style_loss(batch_output, depth, args):
     # Utilize provided utility functions for embedding extraction
     image_embeds = embed_image(batch_output.to(device))  # [Batch, Seq_len, Emb_dim]
     # calculate the depth map of the batch_output
-    from depth import depth_pt_prop_deriv
 
     depth_map_clip_embed = embed_image(depth.to(device))
 
@@ -592,8 +586,11 @@ def train_video(
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    size = video_frames[0].shape
-    size = [size[1], size[2]]
+    print("=== video shape ===")
+    video_frame_shape = video_frames[0].shape
+    size = [video_frame_shape[0], video_frame_shape[1]]
+    print("size", size)
+    print("video_shape", video_frame_shape)
 
     scene_function.to(device)
     camera_position.to(device)
@@ -612,23 +609,29 @@ def train_video(
         batch_camera_poses = []
         batch_rays = []
         batch_t = []
-        batch_output = []
+        batch_colors = []
         batch_depth = []
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
+            # print("frame", frame.shape)
+            # print("camera_poses", camera_poses.shape)
+            # print("camera_rays", camera_rays.shape)
+            # print("frame_depth_estimate", frame_depth_estimate.shape)
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
                 [frame, camera_poses, camera_rays, frame_depth_estimate],
                 n_points,
                 size,
                 boost_edge=args.boost_edge,
             )
+            print("n_points")
+            print("sampled_colors", sampled_colors.shape)
 
             batch_camera_poses.append(sampled_poses)
             batch_rays.append(sampled_rays)
-            batch_output.append(sampled_colors)
+            batch_colors.append(sampled_colors)
             batch_depth.append(sampled_depth_estimates)
 
             # Turn index into scaled t va
@@ -640,11 +643,11 @@ def train_video(
         # Render all rats as a giant batch
         batch_camera_poses = torch.cat(batch_camera_poses, dim=0)
         batch_rays = torch.cat(batch_rays, dim=0)
-        batch_output = torch.cat(batch_output, dim=0)
+        batch_colors = torch.cat(batch_colors, dim=0)
         batch_t = torch.cat(batch_t, dim=0)
         batch_depth = torch.cat(batch_depth, dim=0)
 
-        generated_colors, entropy_regularization, depth = render_rays(
+        generated_colors, entropy_regularization, depth, disp = render_rays(
             scene_function,
             batch_camera_poses,
             batch_rays,
@@ -660,7 +663,9 @@ def train_video(
 
         if args.scale_base_loss != 0:
             loss_fn = nn.MSELoss() if args.loss_type == "mse" else nn.HuberLoss()
-            base_loss = args.scale_base_loss * loss_fn(generated_colors, batch_output)
+            print("generated_colors", generated_colors.shape)
+            print("batch_output", batch_colors.shape)
+            base_loss = args.scale_base_loss * loss_fn(generated_colors, batch_colors)
             log_data[f"{args.loss_type}_loss"] = base_loss.item()
             total_loss += base_loss
 
@@ -899,7 +904,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--entropy_threshold",
         type=float,
-        default=None,
+        default=0.1,
         help="Entropy threshold for entropy loss.",
     )
     parser.add_argument(
@@ -976,6 +981,13 @@ if __name__ == "__main__":
         default=False,
         help="Enable sampling of long temporal frames.",
     )  # some papers argue starting off training with long temporal sampling should help. (I think have many separately spaced runs should be enough)
+    # use_noise
+    parser.add_argument(
+        "--use_noise",
+        action="store_true",
+        default=False,
+        help="Enable noise addition.",
+    )
 
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"

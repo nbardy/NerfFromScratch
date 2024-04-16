@@ -3,8 +3,8 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from utils import debug_tensor
-
 from einops import rearrange
+
 
 from utils import get_default_device
 
@@ -100,11 +100,11 @@ class MultiPathGaussianMLP(nn.Module):
         pos_proj = (2.0 * np.pi * pos @ self.B_pos).float()
         pos_features = torch.cat([torch.sin(pos_proj), torch.cos(pos_proj)], dim=-1)
 
-        print("======")
-        print("shapes")
-        print(pos_features.shape)
-        print(t)
-        print(t.shape)
+        # print("======")
+        # print("shapes")
+        # print(pos_features.shape)
+        # print(t)
+        # print(t.shape)
 
         features_with_time = torch.cat([pos_features, t], dim=-1)
 
@@ -127,7 +127,7 @@ class LearnableLookupTable(nn.Module):
     def scale_indices(self, indices):
         # Scale indices to 0-1 range and then scale to integer values in the range [0, index_width]
         scaled_indices = (indices * torch.tensor(self.dims, device=indices.device).float()).long()
-        debug_tensor("scaled_indices", scaled_indices)
+        # debug_tensor("scaled_indices", scaled_indices)
         return scaled_indices
 
     def forward_without_scale(self, indices):
@@ -283,7 +283,7 @@ class SpacetimeGeometricMLP(nn.Module):
 
         self.feature_mlp = nn.Sequential(*layers)
         self.final_size = hidden_dim if inner_activation else hidden_dim * 2
-        print("final_size", self.final_size, "output_dim", output_dim)
+        # print("final_size", self.final_size, "output_dim", output_dim)
         self.final_layer = nn.Linear(self.final_size, output_dim)
 
     def debug_forward(self, x):
@@ -293,7 +293,7 @@ class SpacetimeGeometricMLP(nn.Module):
 
     def forward(self, x):
 
-        self.debug_forward(x)
+        # self.debug_forward(x)
         x = self.embedding(x)
         x = self.feature_mlp(x)
         x = self.final_layer(x)
@@ -367,7 +367,7 @@ class SegGLUMLP(nn.Module):
 @dataclasses.dataclass
 class MoeArgs(Serializable):
     num_experts: int
-    num_experts_per_tok: int
+    num_selected_experts: int
     num_default_experts: int = 0  # Number of default experts that are always selected
 
 
@@ -388,14 +388,14 @@ class MoeLayer(nn.Module):
         assert moe_args is not None
 
         self.pool_op = pool
-        self.num_specialist_experts = moe_args.num_experts - moe_args.num_default_experts
-
+        # how many to init
         if experts:
-            self.default_experts = nn.ModuleList(experts[: moe_args.num_default_experts])
-            self.specialist_experts = nn.ModuleList(experts[moe_args.num_default_experts :])
+            self.experts = nn.ModuleList(experts)
         elif expert_class:
-            self.default_experts = nn.ModuleList([expert_class() for _ in range(moe_args.num_default_experts)])
-            self.specialist_experts = nn.ModuleList([expert_class() for _ in range(self.num_specialist_experts)])
+            self.experts = nn.ModuleList([expert_class() for _ in range(moe_args.num_experts)])
+
+        self.default_experts = self.experts[: moe_args.num_default_experts]
+        self.specialist_experts = self.experts[moe_args.num_default_experts :]
 
         self.gate = gate
         self.args = moe_args
@@ -403,22 +403,25 @@ class MoeLayer(nn.Module):
     def pool(self, results, batch_idx, item, batch_size):
         # Create empty tensor if results is None
         if results is None:
-            results = torch.zeros(
-                (item.shape[0], self.args.num_experts_per_tok, *item.shape[1:]),
-                dtype=item.dtype,
-                device=item.device,
-            )
-
             if self.pool_op == "append":
+                # Initialize results tensor with an extra dimension of size num_experts_per_tok
+
+                total_experts = self.args.num_selected_experts + self.args.num_default_experts
+                results = torch.zeros(
+                    (item.shape[0], total_experts, *item.shape[1:]),
+                    dtype=item.dtype,
+                    device=item.device,
+                )
                 self.current_index = torch.zeros(item.shape[0], dtype=torch.long, device=item.device)
-        else:
-            results_shape = (batch_size, *item.shape[1:])
-            results = torch.zeros(results_shape, dtype=item.dtype, device=item.device)
+            else:
+                results_shape = (batch_size, *item.shape[1:])
+                results = torch.zeros(results_shape, dtype=item.dtype, device=item.device)
 
         if self.pool_op == "sum":
             results[batch_idx] += item
         elif self.pool_op == "append":
             next_index = self.current_index[batch_idx]
+
             results[batch_idx, next_index] = item
 
             # Increment the current_index for the updated batch items
@@ -427,29 +430,28 @@ class MoeLayer(nn.Module):
         return results
 
     def forward(self, inputs: torch.Tensor, gate_inputs: torch.Tensor = None):
-        print("Moe Layer forward pass")
-        print("experts")
-        print("num default experts:", self.args.num_default_experts)
-        print("num experts per tok:", self.args.num_experts_per_tok)
+        # print("Moe Layer forward pass")
+        # print("experts")
+        # print("num default experts:", self.args.num_default_experts)
+        # print("num experts per tok:", self.args.num_selected_experts)
 
         if gate_inputs is None:
             gate_inputs = inputs
         gate_logits = self.gate(gate_inputs)
 
-        debug_tensor("gate_logits", gate_logits)
-        weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
-        debug_tensor("weights", weights)
+        # debug_tensor("gate_logits", gate_logits)
+        weights, selected_experts = torch.topk(gate_logits, self.args.num_selected_experts)
+        # debug_tensor("weights", weights)
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = None
 
-        debug_tensor("selected experts", selected_experts)
-        debug_tensor("weights(post-softmax)", weights)
+        # debug_tensor("selected experts", selected_experts)
+        # debug_tensor("weights(post-softmax)", weights)
 
         # Process default experts
         for default_expert in self.default_experts:
-            print("calling default expert")
             expert_result = default_expert(inputs)
-            debug_tensor("expert result", expert_result)
+            # debug_tensor("expert result", expert_result)
 
             # set batch_idx as all
             batch_idx = torch.arange(inputs.shape[0], device=inputs.device)
@@ -510,7 +512,11 @@ class MoeSpaceTimeModel(nn.Module):
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
+        # Output dim is 8 because we split it into 2x4 for two different 4 dim features
         geo_class = lambda: (SpaceTimeTransformerEncoder(output_dim=8, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=8))
+        print("---")
+        print(f"scene_feature_size = {scene_feature_size}")
+        print("---")
         render_class = lambda: (
             TransformerEncoder(model_depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
             if use_attention_render
@@ -522,7 +528,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_total, inner_activation=True, inner_bias=True)
         table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_total_tables)
-        feature_gate = lambda: nn.Linear(table_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
+        feature_gate = lambda: nn.Linear(scene_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
         self.geometric_layer = MoeLayer(
             # experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts_total)]),
@@ -530,7 +536,7 @@ class MoeSpaceTimeModel(nn.Module):
             gate=geo_gate(),
             moe_args=MoeArgs(
                 num_experts=num_geo_experts_total,
-                num_experts_per_tok=num_geo_experts_chosen,
+                num_selected_experts=num_geo_experts_chosen,
                 num_default_experts=num_geo_default_experts,
             ),
         )
@@ -544,7 +550,7 @@ class MoeSpaceTimeModel(nn.Module):
             gate=table_gate(),
             moe_args=MoeArgs(
                 num_experts=num_active_tables,
-                num_experts_per_tok=num_table_experts_chosen,
+                num_selected_experts=num_table_experts_chosen,
                 num_default_experts=num_table_default_experts,
             ),
         )
@@ -555,12 +561,10 @@ class MoeSpaceTimeModel(nn.Module):
             gate=feature_gate(),
             moe_args=MoeArgs(
                 num_experts=num_render_experts_total,
-                num_experts_per_tok=num_render_experts_chosen,
+                num_selected_experts=num_render_experts_chosen,
                 num_default_experts=num_render_default_experts,
             ),
         )
-
-        render_feature_size = render_feature_size * num_render_experts
 
         # The original NERF paper shows benefits of having a separate color prediction based on
         # the viewing direction, we do this here as well
@@ -579,13 +583,9 @@ class MoeSpaceTimeModel(nn.Module):
 
         # Debug shapes
         # Concatenate position and time along the feature dimension
-        print(f"debug shapes - pos: {pos.shape}, origin: {origin.shape}, t: {t.shape}")
         x = torch.cat([pos, t], dim=1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
-
-        print("sizes: (geo_features_1, geo_features_2)", geo_features_1.shape, geo_features_2.shape)
-        print("all_geometric", all_geometric.shape)
 
         # We want the data selection to be based on a different geometry than the table index
         # So we gate, Gating on the index values would be too limiting since the values from
@@ -597,14 +597,10 @@ class MoeSpaceTimeModel(nn.Module):
         #  our expert is a table not a function so we need to gate on a non-index value to allow
         # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
-        print("all_table_values", all_table_values.shape)
-        table_features = all_table_values
-        print("table_features", table_features.shape)
+        table_features = rearrange(all_table_values, "b e d ->  b (e d)")
         render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
-        print("render_features", render_features.shape)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
-        print("opacity", opacity.shape)
 
         color_input = torch.cat([render_features, origin, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
         color = self.color_feature_layer(color_input)  # Predict color, Bx3
@@ -808,9 +804,26 @@ class SpaceTimeLookTable(nn.Module):
         return output
 
 
-# If main test models
-# We can then pass that batch of 3D points through the model and see if we get back 4D points
-if __name__ == "__main__":
+def test_moe_append():
+    model = MoeLayer(
+        experts=nn.ModuleList([MLP(input_dim=3, inner_dim=512, output_dim=3, depth=5) for _ in range(10)]),
+        gate=MLP(input_dim=3, inner_dim=512, output_dim=10, depth=5),
+        pool="append",
+        moe_args=MoeArgs(
+            num_experts=10,
+            num_selected_experts=2,
+            num_default_experts=1,
+        ),
+    )
+    input = torch.randn(100, 3)
+    output = model(input)
+
+    print("test moe")
+    print("input shape", input.shape)
+    print("output shape", output.shape)
+
+
+def test_spacetime_moe():
     model = get_model("moe-spacetime")
 
     device = get_default_device()
@@ -820,4 +833,11 @@ if __name__ == "__main__":
     t = torch.randn(100, 1).to(device)
     print("Calling model")
     y = model(pos, dir, t)
-    print(y.shape)
+    print("model output", y.shape)
+
+
+# If main test models
+# We can then pass that batch of 3D points through the model and see if we get back 4D points
+if __name__ == "__main__":
+    test_moe_append()
+    test_spacetime_moe()
