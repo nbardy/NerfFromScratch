@@ -19,6 +19,8 @@ from peft import inject_adapter_in_model, LoraConfig
 from depth import video_depth
 from style import embed_text, embed_image
 
+from preprocess import assert_video_shape
+
 camera_depth = 0.2
 
 near = 0.02
@@ -515,7 +517,7 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
     :return: A list of sampled frames.
     """
     assert args is not None, "Command line arguments or configuration must be provided."
-    assert isinstance(video_frames, list), "video_frames must be a list of video frames"
+    assert_video_shape(video_frames)
 
     sampled_frames = []
     indices = []
@@ -571,7 +573,7 @@ def train_video(
 
     device = get_default_device()
     video_frames = load_video(video_path, max_frames=max_frames)
-    videos_frames = rearrange(video_frames, "f w h c -> f c w h")
+    # video_frames = rearrange(video_frames, "f w h c -> f c w h")
 
     camera_position = LearnableCameraPosition(n_frames=len(video_frames))
     scene_function = get_model(args.model)
@@ -598,8 +600,11 @@ def train_video(
 
     depth_maps = video_depth(video_frames, cache_dir="cache", filename=video_path)
 
+    i = 0
     for epoch in range(epochs):
-        print("Epoch 1")
+        print("Epoch: ", i)
+        i += 1
+
         sampled_frames, sampled_indices = sample_video_frames_by_args(
             video_frames,
             n_frames=n_frames,
@@ -615,6 +620,9 @@ def train_video(
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
+            camera_poses = rearrange(camera_poses, "c w h -> w h c")
+            camera_rays = rearrange(camera_rays, "c w h -> w h c")
+
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
             print("== Sampled ==")
@@ -995,6 +1003,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
     video_frames = load_video(video_path, max_frames=args.max_frames)
+
+    print("After load frame", video_frames.shape)
 
     # pretty print args with names
     print("Arguments")

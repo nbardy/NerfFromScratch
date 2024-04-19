@@ -22,25 +22,31 @@ from einops import rearrange
 model_cache = {}
 
 
-def assert_video_frame_shape(frame: torch.Tensor):
-    """
-    Asserts the video frame shape is in the expected format: *, H, W, 3.
-    """
-    # assert type is tensor
-    assert isinstance(frame, torch.Tensor), f"Input frame must be a torch.Tensor. Got {type(frame)}"
-    # assert shape is *, H, W, 3
-    assert frame.dim() == 4 and frame.shape[-1] == 3, f"Input frame must have a shape of (*, H, W, 3). Got {frame.shape}"
+# Asserts the video frame shape is in the expected format: H, W, 3.
+def assert_is_video_frame(frame: torch.Tensor):
+    common_debug_str = f"Frame shape: {frame.shape}"
+
+    # Check if the input frame is a torch.Tensor and its shape matches the expected format
+    assert isinstance(frame, torch.Tensor), f"Input frame must be a torch.Tensor. Got {type(frame)}. {common_debug_str}"
+    shape = frame.shape
+
+    # color
+    assert shape[2] == 3, f"Expect dim 3 to be 3 len Color channel. Got {shape[2]}"
+    assert len(shape) == 3, f"Expect 3 dimensions. Got {len(shape)} dimensions"
 
 
+# Asserts the video shape is in the expected format:  F, H, W, 3.
+def assert_video_shape(video_frames: torch.Tensor):
+    assert isinstance(video_frames, torch.Tensor)
+    for frame in video_frames:
+        assert_is_video_frame(frame)
+
+
+# Computes the blur score for a single frame using Kornia.
 def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
-    """
-    Computes the blur score for a single frame using Kornia.
-    """
-    # Assert the input frame is in the expected shape: *, H, W, 3
-    assert_video_frame_shape(frame)
-
-    # Rearrange frame to match Kornia's expected input shape: *, 3, H, W
-    frame = frame.permute(0, 3, 1, 2)
+    assert_is_video_frame(frame)
+    # format to kornia expected shape
+    frame = rearrange(frame, "* h w c -> * c h w")
 
     # Convert frame to float type to match expected input type for Kornia's sobel function
     frame = frame.float()  # Convert to float
@@ -51,32 +57,33 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     max_val, min_val = torch.max(edge_magnitude), torch.min(edge_magnitude)
     normalized_edge_magnitude = (edge_magnitude - min_val) / (max_val - min_val)  # Bx1xHxW
     blur_score = 1.0 - torch.mean(normalized_edge_magnitude)  # scalar
+
     return blur_score.item()
 
 
-def generate_hash_and_cache_path(video_frames: list[torch.Tensor], key: str) -> Path:
-    """
-    Generates a consistent hash from the video frames and constructs a cache path.
-    """
+# Generates a consistent hash from the video frames and constructs a cache path.
+def generate_hash_and_cache_path(video_frames: torch.Tensor, key: str) -> Path:
     import hashlib
+
+    print("video frames type", type(video_frames))
 
     hasher = hashlib.sha256()
     for frame in video_frames:
         hasher.update(frame.cpu().numpy().tobytes())  # Update hash with frame bytes
+
     video_frames_hash = hasher.hexdigest()  # Get hexadecimal digest for the hash
     return Path(f"cache/{video_frames_hash}_{key}.pt")  # Construct cache file path using hash
 
 
+# Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
+# and attempts to load from cache if available. Returns a tensor of scores.
 def blur_scores(video_frames: list[torch.Tensor], cache_key=None) -> torch.Tensor:
-    """
-    Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
-    and attempts to load from cache if available. Returns a tensor of scores.
-    """
+    assert_video_shape(video_frames)
     print(type(video_frames))
     # print ype of first frame
     print(video_frames[0].shape)
-    # Step 1: Hash video frames for cache key
 
+    # Step 1: Hash video frames for cache key
     cache_path = generate_hash_and_cache_path(video_frames, key="blur_scores_done")
 
     # Step 2: Check if cache exists and load it
@@ -143,16 +150,16 @@ def deblur_video_vrt(
 model_cache = {}
 
 
+# Process video frames using Swin Transformer model for features and store them using SafeTensors
 def process_video_frames(video_frames):
-    """
-    Process video frames using Swin Transformer model for features and store them using SafeTensors
-    """
     from transformers import AutoFeatureExtractor, Swinv2Model
     import torch
     from safetensors.torch import save_file
     from safetensors import safe_open
     from pathlib import Path
     from tqdm.auto import tqdm
+
+    assert_video_shape(video_frames)
 
     # Ensure cache directory exists
     cache_path = generate_hash_and_cache_path(video_frames, key="processed_features_swin")
@@ -308,14 +315,26 @@ def unload_model(model):
             torch.cuda.empty_cache()
 
 
-def load_video(video_path, max_frames=None):
+from einops import rearrange
+from fractions import Fraction
+from typing import Tuple, Dict, Any
+import torch
 
-    video_frames, _, _ = torchvision.io.read_video(video_path, pts_unit="sec")
-    video_frames = video_frames.float() / 255.0  # Convert to float and normalize
+
+def load_video(video_path: str, max_frames: int = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    video_frames, audio_frames, info = torchvision.io.read_video(
+        filename=video_path,
+        start_pts=0,
+        end_pts=None,
+        pts_unit="sec",
+        output_format="THWC",
+    )
+    video_frames = video_frames.float() / 255.0  # Normalize to [0, 1] # FxHxWxC
     if max_frames is not None:
-        video_frames = video_frames[:max_frames]
-    video_frames_list = [video_frames[i] for i in range(video_frames.shape[0])]
-    return video_frames_list
+        video_frames = video_frames[:max_frames]  # Trim to max_frames if specified # F'xHxWxC
+
+    assert_video_shape(video_frames)
+    return video_frames
 
 
 def main():
