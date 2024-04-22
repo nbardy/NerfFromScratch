@@ -580,9 +580,15 @@ class MoeSpaceTimeModel(nn.Module):
         Concatenates position and time, sums geometric layer outputs, passes through table MoE and render layer, and finally predicts color and opacity.
         """
         pos, origin, t = point, origin, time
+        # non None
+        assert pos is not None, "pos is None"
+        assert origin is not None, "origin is None"
+        assert t is not None, "t is None"
 
         # Debug shapes
         # Concatenate position and time along the feature dimension
+        print("pos shape", pos.shape)
+        print("t shape", t.shape)
         x = torch.cat([pos, t], dim=1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors

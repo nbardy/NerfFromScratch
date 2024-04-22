@@ -132,8 +132,6 @@ def sample_indices(prob_dist, n_samples, total_pixels):
     # Flatten the probability distribution
     prob_dist_flat = prob_dist.view(-1)
     # Debug: Print min and max of the probability distribution
-    # print(prob_dist.shape)
-    # print("N_samples", n_samples)
     # debug_tensor("prob_dist_flat", prob_dist_flat)
     # Sample indices based on the probability distribution without replacement
     indices = torch.multinomial(prob_dist_flat, n_samples, replacement=False)
@@ -155,15 +153,20 @@ def sample_n_points_from_tensors(
         stacked_tensors = image_tensors[0]  # CxHxW
         edge_masks = normalize_edge_detection(stacked_tensors)  # BxHxW
         blurred_edge_masks = kornia.filters.box_blur(edge_masks.unsqueeze(1), kernel_size=(5, 5)).squeeze(1)  # BxHxW
-        # Adjust sampling ratios according to the new distribution: 10% uniform, 30% edge, 60% blurred edge
+
+        # Change rate that we sample from edge vs uniform
         n_uniform = int(n_points * 0.05)
         n_edge = int(n_points * 0.9)
         n_blurred_edge = n_points - n_uniform - n_edge  # Remaining for blurred edge
 
+        # min 1
+        n_uniform = max(1, n_uniform)
+        n_edge = max(1, n_edge)
+        n_blurred_edge = max(1, n_blurred_edge)
+
         # Generate probability distribution for uniform sampling
         # Uniform probability distribution for uniform sampling
         uniform_prob_dist = torch.full((total_pixels,), 1.0 / total_pixels, device=image_tensors[0].device)  # total_pixels
-        # print("uniform_prob_dist shape:", uniform_prob_dist.shape)  # Debug print
         uniform_indices = sample_indices(uniform_prob_dist, n_uniform, total_pixels)  # n_uniform
 
         # Compute mean edge weights for edge and blurred edge masks
@@ -178,8 +181,6 @@ def sample_n_points_from_tensors(
         edge_prob_dist = edge_weights.repeat_interleave(total_pixels // edge_weights.size(0))  # total_pixels
         blurred_edge_prob_dist = blurred_edge_weights.repeat_interleave(total_pixels // blurred_edge_weights.size(0))  # total_pixels
 
-        # print("edge_prob_dist shape:", edge_prob_dist.shape)  # Debug print
-        # print("blurred_edge_prob_dist shape:", blurred_edge_prob_dist.shape)  # Debug print
         # Weighted sampling for edge and blurred edge based on normalized weights
         edge_indices = sample_indices(edge_prob_dist, n_edge, total_pixels)  # n_edge
         blurred_edge_indices = sample_indices(blurred_edge_prob_dist, n_blurred_edge, total_pixels)  # n_blurred_edge
@@ -199,7 +200,7 @@ def sample_n_points_from_tensors(
         # Sample colors from tensor using the generated indices
         sampled_tensor_values = tensor[y_coords, x_coords, :]  # CxN
         # Move the batch to the last dim
-        sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
+        # sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
         sampled_values.append(sampled_tensor_values)
 
     return sampled_values
@@ -240,13 +241,6 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     # Compute 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)  # [batch_size, nb_bins, 3]
     # Flatten points and directions for batch processing
-    print("==== Notice ====")
-    print("Shape ray_origins: ", ray_origins.shape)
-    print("Shape ray_directions: ", ray_directions.shape)
-    print("Shape x: ", x.shape)
-    print("Shape t: ", t.shape)
-    print("nb_bins: ", nb_bins)
-    print("================")
 
     ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
 
@@ -264,7 +258,6 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     sigma = rgba[:, 3]
 
     # Compute alpha values and weights for color accumulation
-    print("shapes", colors.shape, sigma.shape, delta.shape)
     colors = colors.reshape(x.shape)
     sigma = sigma.reshape(x.shape[:-1])
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
@@ -287,9 +280,6 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
         regularization = 0.0
 
     # Accumulate colors along rays
-    print("weights", weights.shape)  # Debugging shape of weights
-    print("colors", colors.shape)  # Debugging shape of colors
-    print("t", t.shape)  # Debugging shape of t
     c = (weights * colors).sum(dim=1)  # Accumulate weighted colors along rays to compute pixel values
     # Fixing depth calculation by ensuring weights are broadcasted correctly for element-wise multiplication with t
     depth = (weights.squeeze(-1) * t).sum(dim=1)  # Accumulate weighted depths along rays
@@ -489,9 +479,6 @@ def sample_with_scores_and_runs(
     if cluster_indices.numel() > n_cluster:
         cluster_indices = cluster_indices[torch.randperm(cluster_indices.numel())[:n_cluster]]
 
-    # Combine and deduplicate indices
-    for index_list in [uniform_indices, diff_indices, blur_indices, cluster_indices]:
-        print(index_list.device)
     all_indices = torch.cat((uniform_indices, diff_indices, blur_indices, cluster_indices))
     unique_indices = torch.unique(all_indices)
 
@@ -565,7 +552,6 @@ def train_video(
     blur_scores=None,
     differences=None,
 ):
-    assert max_frames is not None
     assert args is not None
 
     ## Load Assets
@@ -573,6 +559,7 @@ def train_video(
 
     device = get_default_device()
     video_frames = load_video(video_path, max_frames=max_frames)
+    video_frames = video_frames.to(device)
     # video_frames = rearrange(video_frames, "f w h c -> f c w h")
 
     camera_position = LearnableCameraPosition(n_frames=len(video_frames))
@@ -589,11 +576,9 @@ def train_video(
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    print("=== video shape ===")
     video_frame_shape = video_frames[0].shape
+    frame_count = video_frames.shape[0]
     size = [video_frame_shape[0], video_frame_shape[1]]
-    print("size", size)
-    print("video_shape", video_frame_shape)
 
     scene_function.to(device)
     camera_position.to(device)
@@ -625,20 +610,12 @@ def train_video(
 
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            print("== Sampled ==")
-            print("frame", frame.shape)
-            print("camera_poses", camera_poses.shape)
-            print("camera_rays", camera_rays.shape)
-            print("frame_depth_estimate", frame_depth_estimate.shape)
-
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
                 [frame, camera_poses, camera_rays, frame_depth_estimate],
                 n_points,
                 size,
                 boost_edge=args.boost_edge,
             )
-            print("n_points")
-            print("sampled_colors", sampled_colors.shape)
 
             batch_camera_poses.append(sampled_poses)
             batch_rays.append(sampled_rays)
@@ -646,12 +623,11 @@ def train_video(
             batch_depth.append(sampled_depth_estimates)
 
             # Turn index into scaled t va
-            t = frame_index / max_frames
-            t = torch.ones(n_points, 1) * t
-            t = t.to(device)
+            t = torch.full((n_points, 1), frame_index / frame_count, device=device)  # Bx1
             batch_t.append(t)
 
         # Render all rats as a giant batch
+
         batch_camera_poses = torch.cat(batch_camera_poses, dim=0)
         batch_rays = torch.cat(batch_rays, dim=0)
         batch_colors = torch.cat(batch_colors, dim=0)
@@ -674,9 +650,19 @@ def train_video(
 
         if args.scale_base_loss != 0:
             loss_fn = nn.MSELoss() if args.loss_type == "mse" else nn.HuberLoss()
-            print("generated_colors", generated_colors.shape)
-            print("batch_output", batch_colors.shape)
+
+            # Debug: Check for NaN in inputs to loss function
+            if torch.isnan(generated_colors).any():
+                print("Warning: NaN detected in generated_colors")
+                print(generated_colors)
+            if torch.isnan(batch_colors).any():
+                print("Warning: NaN detected in batch_colors")
+                print(batch_colors)
+
             base_loss = args.scale_base_loss * loss_fn(generated_colors, batch_colors)
+            if torch.isnan(base_loss):
+                print("Warning: NaN detected in base_loss")
+            print("Batch Loss: ", base_loss.item())
             log_data[f"{args.loss_type}_loss"] = base_loss.item()
             total_loss += base_loss
 
@@ -697,6 +683,7 @@ def train_video(
         scheduler.step()
 
         if epoch % args.validation_steps == 0:
+            print("Logging images...")
             log_data.update(
                 log_image(
                     scene_function,
@@ -707,6 +694,7 @@ def train_video(
                     device,
                 )
             )
+            print("done logging image")
 
         log_data["total_loss"] = total_loss.item()
         log_data["learning_rate"] = scheduler.get_last_lr()[0]
@@ -797,11 +785,13 @@ def log_image(scene_function, video_frames, camera_position, size, max_frames, d
     t = t.to(device)
 
     camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=t_val)
-    image = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)
+    image_tensor = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)  # BxCxHxW
+    image_pil = Image.fromarray(image_tensor.cpu().numpy(), "RGB")
     gt_frame = video_frames[t_val]
 
-    log_data["predicted"] = wandb.Image(image)
-    log_data["ground truth"] = wandb.Image(gt_frame)
+    log_data["predicted"] = wandb.Image(image_pil)
+    gt_frame_pil = Image.fromarray(gt_frame.cpu().numpy(), "RGB")
+    log_data["ground truth"] = wandb.Image(gt_frame_pil)
     return log_data
 
 
@@ -836,30 +826,29 @@ def inference_nerf(
     # Flatten camera positions and rays for model input using einops rearrange
     camera_positions_flat = rearrange(camera_positions, "c w h -> (w h) c")  # [W*H, 3]
     camera_rays_flat = rearrange(camera_rays, "c w h -> (w h) c")  # [W*H, 3]
-    model_input = torch.cat([camera_positions_flat, camera_rays_flat, t], dim=1)  # [(W*H), 6]
 
     # Initialize tensor to store generated colors
-    generated_colors = torch.empty((model_input.shape[0], 3), device=model_input.device)
+    generated_colors = torch.empty((camera_positions_flat.shape[0], 3), device=camera_positions_flat.device)  # [W*H, 3]
 
     # Process in batches to avoid memory overflow
-    num_batches = (model_input.shape[0] + max_inference_batch_size - 1) // max_inference_batch_size
+    num_batches = (camera_positions_flat.shape[0] + max_inference_batch_size - 1) // max_inference_batch_size
 
     for i in range(num_batches):
         start_idx = i * max_inference_batch_size
-        end_idx = min(start_idx + max_inference_batch_size, model_input.shape[0])
-        batch_input = model_input[start_idx:end_idx, :]
-        batch_colors = model(batch_input)
-        generated_colors[start_idx:end_idx, :] = batch_colors
+        end_idx = min(start_idx + max_inference_batch_size, camera_positions_flat.shape[0])
+        batch_positions = camera_positions_flat[start_idx:end_idx, :]
+        batch_rays = camera_rays_flat[start_idx:end_idx, :]
+        batch_times = t[start_idx:end_idx, :]
+        rgba = model(point=batch_positions, time=batch_times, origin=batch_rays)
+        colors = rgba[:, :3]
+        generated_colors[start_idx:end_idx, :] = colors
 
     # Scale colors back to [0, 255] and reshape to image dimensions
     scaled_colors = ((generated_colors + 1) * 0.5) * 255  # [(W*H), 3]
     scaled_colors = scaled_colors.clamp(0, 255).byte()
     scaled_colors = rearrange(scaled_colors, "(w h) c -> h w c", w=image_size[0], h=image_size[1])  # [H, W, 3]
 
-    # Convert to PIL Image for visualization
-    image_data = scaled_colors.cpu().numpy()
-    image = Image.fromarray(image_data, "RGB")
-    return image
+    return scaled_colors
 
 
 if __name__ == "__main__":
@@ -870,13 +859,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_points",
         type=int,
-        default=1000,
+        default=1,
         help="Number of points to sample for training",
     )
     parser.add_argument(
         "--n_frames",
         type=int,
-        default=27,
+        default=1,
         help="Number of frames to sample from the video",
     )
     parser.add_argument("--validation_steps", type=int, default=40)
@@ -885,7 +874,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_frames",
         type=int,
-        default=5000,
+        default=None,
         help="Maximum number of frames to use for training and inference.",
     )
     parser.add_argument(
@@ -958,7 +947,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--scale_depth_loss",
         type=float,
-        default=0.3,
+        default=0.0,
         help="Scaling factor for depth loss.",
     )
     parser.add_argument(
@@ -971,7 +960,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--time_sample_clusters",
         type=int,
-        default=20,
+        default=1,
         help="Number of frames to sample in each cluster.",
     )
     parser.add_argument(
@@ -1004,10 +993,7 @@ if __name__ == "__main__":
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
     video_frames = load_video(video_path, max_frames=args.max_frames)
 
-    print("After load frame", video_frames.shape)
-
     # pretty print args with names
-    print("Arguments")
     for arg in vars(args):
         print(f"{arg}: {getattr(args, arg)}")
 

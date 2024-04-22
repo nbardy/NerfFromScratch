@@ -93,8 +93,6 @@ class TransformerBlock(nn.Module):
         self.norm2     = nn.LayerNorm(dim)
 
     def forward(self, x):
-        print("transformer input size", x.shape)
-
         x = x + self.attention(self.norm1(x))  # BxDxP after attention and residual connection
         x = x + self.ff(self.norm2(x))  # BxDxP after feedforward and residual connection
         return x
@@ -156,10 +154,6 @@ class TransformerEncoder(nn.Module):
         self.final_projection   = nn.Linear(projection_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
 
     def forward(self, x):
-        # print("====")
-        # print("input_size", self.input_dim)
-        # print("transformer input size", x.shape)
-        # print("====")
         x = self.embedding(x)
 
         for block in self.transformer_blocks:
