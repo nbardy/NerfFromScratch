@@ -12,7 +12,7 @@ import numpy as np
 import kornia
 
 from models import get_model
-from utils import get_default_device
+from utils import get_default_device, histo_tensor
 from preprocess import blur_scores, deblur_video_vrt, load_video, get_image_feature_difference_scores
 from peft import inject_adapter_in_model, LoraConfig
 
@@ -54,7 +54,7 @@ def make_camera_rays(
     grid_left = grid_left.unsqueeze(0).repeat(3, 1, 1)
     grid_up = grid_up.unsqueeze(0).repeat(3, 1, 1)
 
-    viewport_center = camera_location + camera_direction * camera_depth
+    viewport_center = camera_location - camera_direction * camera_depth
     camera_left = torch.cross(camera_direction, camera_up)
 
     # Rehsape for broadcasting
@@ -68,10 +68,19 @@ def make_camera_rays(
     shift_y = grid_up * camera_up
 
     total_shift = shift_x + shift_y
+    # histo_tensor("total_shift", total_shift)
+    # histo_tensor("viewport_center", viewport_center)
     viewport_positions = total_shift + viewport_center.unsqueeze(1).unsqueeze(2)
 
     # Get viewport ray directions.
     viewport_ray_directions = viewport_positions - camera_location.unsqueeze(1).unsqueeze(2)
+
+    # This spits out the intermediate histos
+
+    # histo_tensor("viewport_positions", viewport_positions)
+    # histo_tensor("viewport_ray_directions", viewport_ray_directions)
+
+    print("Debug make_camera_rays")
 
     return viewport_positions, viewport_ray_directions
 
@@ -222,6 +231,10 @@ def transmittance(alphas):
 def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb_bins=192, args=None):
     device = ray_origins.device
 
+    # histo_tensor("ray_origins", ray_origins)
+    # histo_tensor("ray_directions", ray_directions)
+    # histo_tensor("times", times)
+
     t = torch.linspace(hn, hf, steps=nb_bins, device=device).expand(ray_origins.shape[0], nb_bins)  # Bxnb_bins
     # Perturb sampling along each ray for stochastic sampling
     mid = (t[:, :-1] + t[:, 1:]) / 2.0  # Midpoints for perturbation
@@ -244,8 +257,11 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
 
     ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
 
+    print("ray_origins", ray_origins.shape)
     ray_origins = repeat(ray_origins, "b c -> b nb_bins c", nb_bins=nb_bins)  # Bxnb_binsx3
+    print("pre times", times.shape)
     times = repeat(times, "b 1 -> b nb_bins", nb_bins=nb_bins)  # Bxnb_bins
+    print("post times", times.shape)
 
     # Use einops.rearrange for reshaping operations
     flat_x = rearrange(x, "b nb_bins c -> (b nb_bins) c")  # B*nb_binsx3
@@ -253,9 +269,17 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     flat_origin = rearrange(ray_origins, "b nb_bins c -> (b nb_bins) c")  # B*nb_binsx3
 
     # Query NeRF model for colors and densities
+    # for input in zip([flat_x, flat_times, flat_origin], ["flat_x", "flat_times", "flat_origin"]):
+    #     histo_tensor(input[1], input[0])
+    # Print the hist
     rgba = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
+    # check for nan if nan print tensor
+
     colors = rgba[:, :3]
     sigma = rgba[:, 3]
+
+    # histo_tensor("colors", colors)
+    histo_tensor("sigma", sigma)
 
     # Compute alpha values and weights for color accumulation
     colors = colors.reshape(x.shape)
@@ -608,6 +632,9 @@ def train_video(
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
             camera_rays = rearrange(camera_rays, "c w h -> w h c")
 
+            # histo_tensor("camera_poses", camera_poses)
+            # histo_tensor("camera_rays", camera_rays)
+
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
@@ -622,8 +649,12 @@ def train_video(
             batch_colors.append(sampled_colors)
             batch_depth.append(sampled_depth_estimates)
 
+            # There is some rounding in the sampling that can make this not = n_points
+            actual_sampled_point_count = sampled_colors.shape[0]
+            print("actual_sampled_point_count", actual_sampled_point_count)
+
             # Turn index into scaled t va
-            t = torch.full((n_points, 1), frame_index / frame_count, device=device)  # Bx1
+            t = torch.full((actual_sampled_point_count, 1), frame_index / frame_count, device=device)  # Bx1
             batch_t.append(t)
 
         # Render all rats as a giant batch
@@ -652,16 +683,24 @@ def train_video(
             loss_fn = nn.MSELoss() if args.loss_type == "mse" else nn.HuberLoss()
 
             # Debug: Check for NaN in inputs to loss function
+            histo_tensor("generated_colors", generated_colors)
             if torch.isnan(generated_colors).any():
                 print("Warning: NaN detected in generated_colors")
                 print(generated_colors)
+            histo_tensor("batch_colors", batch_colors)
             if torch.isnan(batch_colors).any():
                 print("Warning: NaN detected in batch_colors")
                 print(batch_colors)
 
             base_loss = args.scale_base_loss * loss_fn(generated_colors, batch_colors)
+
+            # debug loss
             if torch.isnan(base_loss):
                 print("Warning: NaN detected in base_loss")
+
+            if not torch.isfinite(base_loss):
+                print("Warning Inf base loss")
+
             print("Batch Loss: ", base_loss.item())
             log_data[f"{args.loss_type}_loss"] = base_loss.item()
             total_loss += base_loss
@@ -682,7 +721,7 @@ def train_video(
         optimizer.step()
         scheduler.step()
 
-        if epoch % args.validation_steps == 0:
+        if epoch % args.validation_steps == 0 and args.should_log_validation_image:
             print("Logging images...")
             log_data.update(
                 log_image(
@@ -690,7 +729,7 @@ def train_video(
                     video_frames,
                     camera_position,
                     size,
-                    max_frames,
+                    frame_count,
                     device,
                 )
             )
@@ -776,12 +815,12 @@ def train_style_video(
         wandb.log(log_data)
 
 
-def log_image(scene_function, video_frames, camera_position, size, max_frames, device):
+def log_image(scene_function, video_frames, camera_position, size, total_frames, device):
     log_data = {}
     total_points = size[0] * size[1]
     # First  frames
     t_val = 0
-    t = torch.ones(total_points, 1) * (t_val / max_frames)
+    t = torch.ones(total_points, 1) * (t_val / total_frames)
     t = t.to(device)
 
     camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=t_val)
@@ -851,145 +890,148 @@ def inference_nerf(
     return scaled_colors
 
 
+import argparse
+
+parser = argparse.ArgumentParser(description="Train a NeRF model on a single image.")
+parser.add_argument("--epochs", type=int, default=200, help="Number of epochs to train.")
+parser.add_argument(
+    "--n_points",
+    type=int,
+    default=1,
+    help="Number of points to sample for training",
+)
+parser.add_argument(
+    "--n_frames",
+    type=int,
+    default=1,
+    help="Number of frames to sample from the video",
+)
+parser.add_argument("--validation_steps", type=int, default=40)
+# bool
+parser.add_argument("--should_log_validation_image", action="store_true", default=False)
+parser.add_argument("--video_validation_steps", type=int, default=50)
+parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to use")
+parser.add_argument(
+    "--max_frames",
+    type=int,
+    default=None,
+    help="Maximum number of frames to use for training and inference.",
+)
+parser.add_argument(
+    "--deblur_video",
+    action="store_true",
+    default=False,
+    help="Enable video deblurring.",
+)
+parser.add_argument(
+    "--weight_blur_and_difference",
+    action="store_true",
+    default=True,
+    help="Enable weighted frame sampling based on blur and difference.",
+)
+parser.add_argument(
+    "--boost_edge",
+    action="store_true",
+    default=True,
+    help="Enable edge boosting.",
+)
+parser.add_argument(
+    "--enable_entropy_loss",
+    action="store_true",
+    default=True,
+    help="Enable entropy loss regularization.",
+)
+parser.add_argument(
+    "--entropy_threshold",
+    type=float,
+    default=0.1,
+    help="Entropy threshold for entropy loss.",
+)
+parser.add_argument(
+    "--geo_style_text",
+    type=str,
+    default=None,
+    help="Text prompt for geo style.",
+)
+parser.add_argument(
+    "--geo_style_image",
+    type=str,
+    default=None,
+    help="Path to an image file for geo style.",
+)
+parser.add_argument(
+    "--clip_style_text",
+    type=str,
+    default=None,
+    help="Text prompt for clip style.",
+)
+parser.add_argument(
+    "--clip_style_image",
+    type=str,
+    default=None,
+    help="Path to an image file for clip style.",
+)
+# Add arguments for loss scaling
+parser.add_argument(
+    "--scale_base_loss",
+    type=float,
+    default=1.0,
+    help="Scaling factor for base loss.",
+)
+parser.add_argument(
+    "--scale_entropy_loss",
+    type=float,
+    default=0.2,
+    help="Scaling factor for entropy loss.",
+)
+parser.add_argument(
+    "--scale_depth_loss",
+    type=float,
+    default=0.0,
+    help="Scaling factor for depth loss.",
+)
+parser.add_argument(
+    "--loss_type",
+    type=str,
+    default="mse",
+    choices=["mse", "huber"],
+    help="Type of loss function to use for base loss.",
+)
+parser.add_argument(
+    "--time_sample_clusters",
+    type=int,
+    default=1,
+    help="Number of frames to sample in each cluster.",
+)
+parser.add_argument(
+    "--lr",
+    type=float,
+    default=0.001,
+    help="Learning rate for the optimizer.",
+)
+parser.add_argument(
+    "--weight_decay",
+    type=float,
+    default=0.0001,
+    help="Weight decay for the optimizer.",
+)
+parser.add_argument(
+    "--sample_long_temporal",
+    action="store_true",
+    default=False,
+    help="Enable sampling of long temporal frames.",
+)  # some papers argue starting off training with long temporal sampling should help. (I think have many separately spaced runs should be enough)
+# use_noise
+parser.add_argument(
+    "--use_noise",
+    action="store_true",
+    default=False,
+    help="Enable noise addition.",
+)
+
+args = parser.parse_args()
+
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Train a NeRF model on a single image.")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs to train.")
-    parser.add_argument(
-        "--n_points",
-        type=int,
-        default=1,
-        help="Number of points to sample for training",
-    )
-    parser.add_argument(
-        "--n_frames",
-        type=int,
-        default=1,
-        help="Number of frames to sample from the video",
-    )
-    parser.add_argument("--validation_steps", type=int, default=40)
-    parser.add_argument("--video_validation_steps", type=int, default=50)
-    parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to use")
-    parser.add_argument(
-        "--max_frames",
-        type=int,
-        default=None,
-        help="Maximum number of frames to use for training and inference.",
-    )
-    parser.add_argument(
-        "--deblur_video",
-        action="store_true",
-        default=False,
-        help="Enable video deblurring.",
-    )
-    parser.add_argument(
-        "--weight_blur_and_difference",
-        action="store_true",
-        default=True,
-        help="Enable weighted frame sampling based on blur and difference.",
-    )
-    parser.add_argument(
-        "--boost_edge",
-        action="store_true",
-        default=True,
-        help="Enable edge boosting.",
-    )
-    parser.add_argument(
-        "--enable_entropy_loss",
-        action="store_true",
-        default=True,
-        help="Enable entropy loss regularization.",
-    )
-    parser.add_argument(
-        "--entropy_threshold",
-        type=float,
-        default=0.1,
-        help="Entropy threshold for entropy loss.",
-    )
-    parser.add_argument(
-        "--geo_style_text",
-        type=str,
-        default=None,
-        help="Text prompt for geo style.",
-    )
-    parser.add_argument(
-        "--geo_style_image",
-        type=str,
-        default=None,
-        help="Path to an image file for geo style.",
-    )
-    parser.add_argument(
-        "--clip_style_text",
-        type=str,
-        default=None,
-        help="Text prompt for clip style.",
-    )
-    parser.add_argument(
-        "--clip_style_image",
-        type=str,
-        default=None,
-        help="Path to an image file for clip style.",
-    )
-    # Add arguments for loss scaling
-    parser.add_argument(
-        "--scale_base_loss",
-        type=float,
-        default=1.0,
-        help="Scaling factor for base loss.",
-    )
-    parser.add_argument(
-        "--scale_entropy_loss",
-        type=float,
-        default=0.2,
-        help="Scaling factor for entropy loss.",
-    )
-    parser.add_argument(
-        "--scale_depth_loss",
-        type=float,
-        default=0.0,
-        help="Scaling factor for depth loss.",
-    )
-    parser.add_argument(
-        "--loss_type",
-        type=str,
-        default="mse",
-        choices=["mse", "huber"],
-        help="Type of loss function to use for base loss.",
-    )
-    parser.add_argument(
-        "--time_sample_clusters",
-        type=int,
-        default=1,
-        help="Number of frames to sample in each cluster.",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.001,
-        help="Learning rate for the optimizer.",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.0001,
-        help="Weight decay for the optimizer.",
-    )
-    parser.add_argument(
-        "--sample_long_temporal",
-        action="store_true",
-        default=False,
-        help="Enable sampling of long temporal frames.",
-    )  # some papers argue starting off training with long temporal sampling should help. (I think have many separately spaced runs should be enough)
-    # use_noise
-    parser.add_argument(
-        "--use_noise",
-        action="store_true",
-        default=False,
-        help="Enable noise addition.",
-    )
-
-    args = parser.parse_args()
     video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
     video_frames = load_video(video_path, max_frames=args.max_frames)
 
@@ -1013,25 +1055,25 @@ if __name__ == "__main__":
     # Launch training with deblurred video if enabled, otherwise use original video path
     video_to_train = deblurred_video if args.deblur_video else video_path
 
-    if args.geo_style_image or args.clip_style_image:
-        train_style_video(
-            video_to_train,
-            epochs=args.epochs,
-            n_points=args.n_points,
-            n_frames=args.n_frames,
-            max_frames=args.max_frames,
-            blur_scores=blur_scores,
-            differences=differences,
-            args=args,  # Pass args to access style-related flags
-        )
-    else:
-        train_video(
-            video_to_train,
-            epochs=args.epochs,
-            n_points=args.n_points,
-            n_frames=args.n_frames,
-            max_frames=args.max_frames,
-            blur_scores=blur_scores,
-            differences=differences,
-            args=args,  # Pass args to access enable_entropy_loss flag
-        )
+    # if args.geo_style_image or args.clip_style_image:
+    #     train_style_video(
+    #         video_to_train,
+    #         epochs=args.epochs,
+    #         n_points=args.n_points,
+    #         n_frames=args.n_frames,
+    #         max_frames=args.max_frames,
+    #         blur_scores=blur_scores,
+    #         differences=differences,
+    #         args=args,  # Pass args to access style-related flags
+    #     )
+    # else:
+    train_video(
+        video_to_train,
+        epochs=args.epochs,
+        n_points=args.n_points,
+        n_frames=args.n_frames,
+        max_frames=args.max_frames,
+        blur_scores=blur_scores,
+        differences=differences,
+        args=args,  # Pass args to access enable_entropy_loss flag
+    )

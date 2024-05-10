@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from utils import debug_tensor
+from utils import debug_tensor, histo_tensor
 from einops import rearrange
 
 
@@ -231,6 +231,15 @@ class SphericalEmbedding(nn.Module):
         return proj
 
 
+def test_spherical_embeddings():
+    print("test_spherical_embeddings")
+    sphere_layer = SphericalEmbedding()
+    x = torch.randn(10, 3)
+    debug_tensor("x", x)
+    y = sphere_layer(x)
+    debug_tensor("y", y)
+
+
 # Projects a time point to a higher dimension embedding
 class TimeEmbedding(nn.Module):
     def __init__(self):
@@ -430,10 +439,6 @@ class MoeLayer(nn.Module):
         return results
 
     def forward(self, inputs: torch.Tensor, gate_inputs: torch.Tensor = None):
-        # print("Moe Layer forward pass")
-        # print("experts")
-        # print("num default experts:", self.args.num_default_experts)
-        # print("num experts per tok:", self.args.num_selected_experts)
 
         if gate_inputs is None:
             gate_inputs = inputs
@@ -587,8 +592,6 @@ class MoeSpaceTimeModel(nn.Module):
 
         # Debug shapes
         # Concatenate position and time along the feature dimension
-        print("pos shape", pos.shape)
-        print("t shape", t.shape)
         x = torch.cat([pos, t], dim=1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
@@ -603,13 +606,24 @@ class MoeSpaceTimeModel(nn.Module):
         #  our expert is a table not a function so we need to gate on a non-index value to allow
         # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
+
+        histo_tensor("table_values", all_table_values)
+
         table_features = rearrange(all_table_values, "b e d ->  b (e d)")
         render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
 
+        histo_tensor("render_features", render_features)
+
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
+        opacity = torch.relu(opacity)
+
+        histo_tensor("opacity", opacity)
 
         color_input = torch.cat([render_features, origin, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
         color = self.color_feature_layer(color_input)  # Predict color, Bx3
+        color = torch.sigmoid(color)
+
+        histo_tensor("color", color)
 
         return torch.cat([color, opacity], dim=-1)  # Return color and opacity, Bx4
 
@@ -619,195 +633,10 @@ def get_model(model_name, input_dim=6):
         return MLP(input_dim=input_dim, inner_dim=512, output_dim=3, depth=5)
     elif model_name == "mlp-gauss":
         return GaussianFeatureMLP(input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0)
-    elif model_name == "spacetime-lookup":
-
-        print("Using spacetime lookup table")
-        return SpaceTimeLookTable(
-            output_dim=4,
-            inner_dim=64,
-        )
     elif model_name == "moe-spacetime":
         return MoeSpaceTimeModel()
     else:
         raise ValueError(f"Model {model_name} not found")
-
-
-# This is the authors attempt to impliment a naive lookup table version of instantNGP for videos over time
-# - Nicholas Bardy
-#
-# For fast training without the custom CUDA/triton code
-#
-# This introduces a set of lookup tables at different resolutions in time and space to build features.
-# I have abandoned his for feavoring identical lookup tables with expert gating for a simpler approach
-# with similar effects
-from geometry import face_directions, corner_directions, temporal_directions, exponential_temporal_directions
-
-
-# This crosses offset lists of 3D and 4D space and time
-def generate_space_time_offsets(spatial_offsets, temporal_offsets):
-    """
-    Generates a comprehensive list of offsets for neighbor lookups in space-time,
-    combining spatial and temporal offsets.
-
-    Parameters:
-    - spatial_offsets: List of tuples representing spatial shifts.
-    - temporal_offsets: List of tuples representing temporal shifts.
-
-    Returns:
-    - A list of combined space-time offsets.
-    """
-    combined_offsets = []
-    # Combine each spatial offset with each temporal offset
-    for spatial_offset in spatial_offsets:
-        for temporal_offset in temporal_offsets:
-            combined_offsets.append(spatial_offset + (temporal_offset[3],))
-
-    return combined_offsets
-
-
-class SpaceTimeLookTable(nn.Module):
-    basic_space_time_offsets = generate_space_time_offsets(face_directions + corner_directions, temporal_directions)
-    exponential_time_offsets = generate_space_time_offsets(basic_space_time_offsets, exponential_temporal_directions)
-
-    def __init__(self, output_dim=4, inner_dim=64, use_attention=True):
-        super(SpaceTimeLookTable, self).__init__()
-        # Define the lookup tables for spatial features
-        self.table0 = LearnableLookupTable((128, 128, 128), 64)
-        self.table1 = LearnableLookupTable((64, 64, 64), 64 * 8)
-        self.table2 = LearnableLookupTable((32, 32, 32), 64 * 8 * 8)
-        self.table3 = LearnableLookupTable((16, 16, 16), 64 * 8 * 8 * 8)
-
-        # Define the lookup tables for spacetime features
-        self.space_time_table_1 = LearnableLookupTable((16, 16, 16, 64), 64)  # 16x16x16x64x64
-        self.space_time_table_2 = LearnableLookupTable((128, 128, 64, 16), 8)  # 128x128x64x16x8
-
-        # We sample all corner neighbors and we do it in time direction exponentialy [-64, -8, -4, -2, -1, 0, 1, 2, 4, 8, 64]
-        # We sample 10 frames in each direction and we do it in 3 time steps
-        self.time_focus_spacetime_table3 = LearnableLookupTable((4, 4, 4, 512 * 512), 8)
-
-        from transformers_model_code import SpaceTimeTransformerEncoder
-
-        if use_attention:
-            self.geom_proj_mlp = SpaceTimeTransformerEncoder(input_dim=4, output_dim=4, embedding_depth=8, projection_dim=8, heads=8, model_depth=1)
-        else:
-            self.geom_proj_mlp = SpacetimeGeometricMLP(has_t=True)
-
-        # Linear layer to downsize feature dimension and append viewing direction
-        # The input dimension calculation is broken down as follows:
-        total_feature_size = (
-            # table0 x sampled for 6 face + 1 base
-            64 * (6 + 1)
-            # table1 x sampled for 6 face + 1 base
-            + (64 * 8) * (6 + 1)
-            # table2 x sampled for 6 face + 1 base
-            + (64 * 8 * 8) * (6 + 1)
-            # table3 x sampled for 6 face + 1 base
-            + (64 * 8 * 8 * 8) * (6 + 1)
-            # time_space_table1 * 6 faces + 8 corners * 3 (before, current, after)
-            + (64 * ((6 + 8) * 3))
-            # time_space_table2 * 8 corners* 3 (before, current, after)
-            + 8 * ((6 + 8) * 3)
-            # time_focus_spacetime_table3 * 8
-            + 8 * (11 * 8)
-        )
-
-        if use_attention:
-            self.value_mlp = SpaceTimeTransformerEncoder(
-                input_dim=total_feature_size, output_dim=inner_dim, embedding_depth=8, projection_dim=inner_dim, heads=8, model_depth=1
-            )
-        else:
-            self.value_mlp = nn.Sequential(
-                RMSNorm(total_feature_size),
-                nn.Linear(total_feature_size, total_feature_size * 2, bias=False),
-                GEGLU(),
-                RMSNorm(total_feature_size * 2),
-                nn.Linear(total_feature_size, inner_dim, bias=False),
-            )
-
-        # Final projection to color and alpha
-        self.final_projection = nn.Linear(inner_dim + 3 + 1, output_dim)  # Append dir and t
-
-    def debug_forward(self, point=None, time=None, ray=None):
-        print("Debug forward")
-        print(point, time, ray)
-
-        # Print the range min median and min and max
-        print("Point range: ", torch.min(point), torch.median(point), torch.max(point))
-        print("Time range: ", torch.min(time), torch.median(time), torch.max(time))
-        print("Ray range: ", torch.min(ray), torch.median(ray), torch.max(ray))
-
-    def forward(self, point=None, time=None, ray=None, debug_mode=False):
-        if debug_mode:
-            self.debug_forward(point, time, ray)
-        pos, dir, t = point, time, ray
-        # Start by projecting with geo to look
-        pos = self.geom_proj_mlp(pos, dir, t)
-
-        # Scale pos and t to the table sizes using the scale_indices method
-        idx0 = self.table0.scale_indices(pos)
-        idx1 = self.table1.scale_indices(pos)
-        idx2 = self.table2.scale_indices(pos)
-        idx3 = self.table3.scale_indices(pos)
-
-        # Combine pos and t for 4D indexing in space_time_table_1
-        # Concatenate position and time for 4D tensor Bx4
-        pos_t = torch.cat([pos, t.unsqueeze(-1)], dim=-1)
-        # Scale indices for space-time tables
-        idx_space_time_table_1 = self.space_time_table_1.scale_indices(pos_t)
-        idx_space_time_table_2 = self.space_time_table_2.scale_indices(pos_t)
-        idx_time_focus = self.time_focus_spacetime_table3.scale_indices(pos_t)
-
-        # Get base features from spatial tables
-        base_features0 = self.table0.forward_without_scale(idx0)  # BxCxHxW
-        base_features1 = self.table1(idx1)  # BxCxHxW
-        base_features2 = self.table2(idx2)  # BxCxHxW
-        base_features3 = self.table3(idx3)  # BxCxHxW
-
-        # Get neighbor features from spatial tables
-        neighbor_indices_0 = lookup_neighbors(idx0, self.face_directions, self.table0)
-        neighbor_indices_1 = lookup_neighbors(idx1, self.face_directions, self.table1)
-        neighbor_indices_2 = lookup_neighbors(idx2, self.face_directions, self.table2)
-        neighbor_indices_3 = lookup_neighbors(idx3, self.face_directions, self.table3)
-
-        neighbor_features0 = self.table0.forward_without_scale(neighbor_indices_0)
-        neighbor_features1 = self.table1.forward_without_scale(neighbor_indices_1)
-        neighbor_features2 = self.table2.forward_without_scale(neighbor_indices_2)
-        neighbor_features3 = self.table3.forward_without_scale(neighbor_indices_3)
-
-        # All features tensors are of shape Bx((1+N)*C)xHxW
-        # Lookup temporal features using the new utility function
-        spacetime_features_1 = self.space_time_table_1.forward_without_scale(idx_space_time_table_1)
-        spacetime_features_2 = self.space_time_table_2.forward_without_scale(idx_space_time_table_2)
-        time_focus_features = self.time_focus_spacetime_table3.forward_without_scale(idx_time_focus)
-
-        # Combine base and neighbor features for all tables
-        features0 = torch.cat([base_features0, neighbor_features0], dim=1)
-        features1 = torch.cat([base_features1, neighbor_features1], dim=1)
-        features2 = torch.cat([base_features2, neighbor_features2], dim=1)
-        features3 = torch.cat([base_features3, neighbor_features3], dim=1)
-
-        # Concatenate all features
-        all_features = torch.cat(
-            [
-                features0,
-                features1,
-                features2,
-                features3,
-                spacetime_features_1,
-                spacetime_features_2,
-                time_focus_features,
-            ],
-            dim=-1,
-        )
-
-        # Downsize feature dimension and append viewing direction and timestep
-        downsized_features = self.value_mlp(all_features)
-        final_features = torch.cat([downsized_features, dir, t.unsqueeze(-1)], dim=-1)
-
-        # Apply a biasless linear hidden layer
-        output = self.final_projection(final_features)
-
-        return output
 
 
 def test_moe_append():
@@ -823,6 +652,11 @@ def test_moe_append():
     )
     input = torch.randn(100, 3)
     output = model(input)
+
+    # test that model output has no nan
+    if torch.isnan(output).any():
+        print("output has nan")
+        print(output)
 
     print("test moe")
     print("input shape", input.shape)
@@ -841,9 +675,54 @@ def test_spacetime_moe():
     y = model(pos, dir, t)
     print("model output", y.shape)
 
+    # Define a function for rich assertions with emoji feedback
+    def rich_assert(condition, success_msg, fail_msg, success_emoji="✅", fail_emoji="❌"):
+        if condition:
+            print(f"{success_emoji} {success_msg}")
+        else:
+            print(f"{fail_emoji} {fail_msg}")
+
+    # Asserting the output shape and checking for NaN values in the output
+    rich_assert(y.shape == (100, 4), "Output shape is correct: 100x4", "Output shape is incorrect, expected 100x4")
+    rich_assert(not torch.isnan(y).any(), "No NaN values in the output", "NaN values detected in the output")
+
+
+def test_spacetime_moe_training():
+    model = get_model("moe-spacetime")
+    device = get_default_device()
+    model = model.to(device)
+
+    # Adding a single linear layer to project the 4D output to 1D for binary classification
+    classifier = nn.Linear(4, 1).to(device)
+
+    # Setting up the optimizer and loss function
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(classifier.parameters()), lr=0.001)
+    criterion = nn.BCEWithLogitsLoss()
+
+    # Generating synthetic data for training
+    pos = torch.randn(100, 3).to(device)
+    dir = torch.randn(100, 3).to(device)
+    t = torch.randn(100, 1).to(device)
+    labels = torch.randint(0, 2, (100, 1)).float().to(device)  # Binary labels
+
+    print("Starting training loop")
+    for epoch in range(20):  # Training for 2 epochs
+        optimizer.zero_grad()
+        y = model(pos, dir, t)
+        logits = classifier(y)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch+1}, Loss: {loss.item()}")
+
+    print("Training complete")
+    print("Final model output shape", logits.shape)  # Bx1
+
 
 # If main test models
 # We can then pass that batch of 3D points through the model and see if we get back 4D points
 if __name__ == "__main__":
-    test_moe_append()
-    test_spacetime_moe()
+    # test_spherical_embeddings()
+    # test_moe_append()
+    # test_spacetime_moe()
+    test_spacetime_moe_training()

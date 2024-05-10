@@ -10,6 +10,32 @@ def debug_tensor(name, tensor):
         print(f"{name:<20} min: {tensor.min():<10}, max: {tensor.max():<10}, shape: {tensor.shape}")
 
 
+# histo tensor fn
+def histo_tensor(name, tensor):
+    print()
+    print(f"== {name} ==")
+    print("Tensor shape:", tensor.shape)  # Print the shape of the tensor
+    print("Contains NaN:", torch.isnan(tensor).any())  # Check and print if there are any NaN values in the tensor
+
+    if torch.isnan(tensor).any():
+        print(f"{name} has nan")
+        print(tensor)
+
+    # Define the bins for the histogram based on the tensor type
+    # Use default bins for histogram
+    bins = torch.linspace(-10, 10, steps=21)  # Default bins from -10 to 10 with 20 intervals
+    # Compute the histogram
+    hist = torch.histc(tensor.float(), bins=20, min=-10, max=10)
+
+    # Print the histogram
+    from ascii_graph import Pyasciigraph
+
+    graph = Pyasciigraph()
+    hist_data = [(f"{bins[i]} to {bins[i+1]}", hist[i].item()) for i in range(len(bins) - 1)]
+    for line in graph.graph("Tensor Value Distribution", hist_data):
+        print(line)
+
+
 def get_default_device():
     print("Checking device...")
     if torch.backends.mps.is_available():
