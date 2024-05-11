@@ -55,7 +55,7 @@ def make_camera_rays(
     grid_up = grid_up.unsqueeze(0).repeat(3, 1, 1)
 
     viewport_center = camera_location - camera_direction * camera_depth
-    camera_left = torch.cross(camera_direction, camera_up)
+    camera_left = torch.cross(camera_direction, camera_up, dim=0)
 
     # Rehsape for broadcasting
     camera_left = camera_left.view(3, 1, 1)
@@ -601,6 +601,11 @@ def train_video(
     video_frame_shape = video_frames[0].shape
     frame_count = video_frames.shape[0]
     size = [video_frame_shape[0], video_frame_shape[1]]
+    # 1/4th of the original size int math
+    import math
+
+    factor = 8
+    small_image_size = [math.ceil(video_frame_shape[0] / factor), math.ceil(video_frame_shape[1] / factor)]
 
     scene_function.to(device)
     camera_position.to(device)
@@ -735,18 +740,14 @@ def train_video(
             optimizer.step()
             scheduler.step()
 
-        if epoch % args.validation_steps == 0 and args.should_log_validation_image:
-            print("Logging images...")
-            log_data.update(
-                log_image(
-                    scene_function,
-                    video_frames,
-                    camera_position,
-                    size,
-                    frame_count,
-                    device,
-                )
-            )
+        # Log a small thumbnail always 1/4 size
+        if args.should_log_validation_image:
+            print("Logging image...")
+            log_data.update(log_image(scene_function, video_frames, camera_position, small_image_size, frame_count, prefix="small_image"))
+
+        if epoch != 0 and epoch % args.validation_steps == 0 and args.should_log_validation_image:
+            print("Logging image...")
+            log_data.update(log_image(scene_function, video_frames, camera_position, size, frame_count))
             print("done logging image")
 
         log_data["total_loss"] = total_loss.item()
@@ -821,7 +822,6 @@ def train_style_video(
 
         # log generated colors and depth
         histo_tensor("generated_colors", generated_colors)
-        histo_tensor("batch_colors", batch_colors)
 
         log_data = {
             "generated_colors": wandb.Image(generated_colors),
@@ -832,7 +832,9 @@ def train_style_video(
         wandb.log(log_data)
 
 
-def log_image(scene_function, video_frames, camera_position, size, total_frames, device):
+def log_image(scene_function, video_frames, camera_position, size, total_frames, device=None, prefix=None):
+    if device is None:
+        device = get_default_device()
     log_data = {}
     total_points = size[0] * size[1]
     # First  frames
@@ -845,9 +847,9 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     image_pil = Image.fromarray(image_tensor.cpu().numpy(), "RGB")
     gt_frame = video_frames[t_val]
 
-    log_data["predicted"] = wandb.Image(image_pil)
+    log_data[f"{prefix}_predicted"] = wandb.Image(image_pil)
     gt_frame_pil = Image.fromarray(gt_frame.cpu().numpy(), "RGB")
-    log_data["ground truth"] = wandb.Image(gt_frame_pil)
+    log_data[f"{prefix}_ground truth"] = wandb.Image(gt_frame_pil)
     return log_data
 
 

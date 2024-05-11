@@ -32,14 +32,22 @@ def assert_is_video_frame(frame: torch.Tensor):
     assert isinstance(frame, torch.Tensor), f"Input frame must be a torch.Tensor. Got {type(frame)}. {common_debug_str}"
     shape = frame.shape
 
-    # color
-    assert shape[2] == 3, f"Expect dim 3 to be 3 len Color channel. Got {shape[2]}"
-    assert len(shape) == 3, f"Expect 3 dimensions. Got {len(shape)} dimensions"
+    # Ensure the tensor has a height, width, and a color channel of size 3
+    assert shape[2] == 3, f"Expect dim 2 to be 3 for Color channel.\nExpected: (H, W, 3)\nActual: {shape}"
+    assert len(shape) == 3, f"Expect 3 dimensions.\nExpected: (H, W, 3)\nActual: {shape}"
 
 
 # Asserts the video shape is in the expected format:  F, H, W, 3.
 def assert_video_shape(video_frames: torch.Tensor):
     assert isinstance(video_frames, torch.Tensor)
+    # shape *, H, W, 3 | where H > 280, W > 280, * > 20
+    assert len(video_frames.shape) == 4, f"Expect 4 dimensions. Got {len(video_frames.shape)} dimensions"
+    assert video_frames.shape[1] > 280, f"Expect height to be greater than 280. Got {video_frames.shape[1]}"
+    assert video_frames.shape[2] > 280, f"Expect width to be greater than 280. Got {video_frames.shape[2]}"
+    assert video_frames.shape[0] > 20, f"Expect frames to be greater than 20. Got {video_frames.shape[0]}"
+
+    print("vfs", video_frames.shape)
+
     for frame in video_frames:
         assert_is_video_frame(frame)
 
@@ -48,11 +56,10 @@ def assert_video_shape(video_frames: torch.Tensor):
 def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     assert_is_video_frame(frame)
     # format to kornia expected shape
-    frame = rearrange(frame, "* h w c -> * c h w")
+    frame = rearrange(frame, "h w c -> 1 c h w")  # 1xCxHxW
 
     # Convert frame to float type to match expected input type for Kornia's sobel function
-    frame = frame.float()  # Convert to float
-
+    frame = frame.float()  # 1xCxHxW
     gray_frame_tensor = K.color.rgb_to_grayscale(frame)  # Bx1xHxW
     edges = K.filters.sobel(gray_frame_tensor)  # Bx1xHxW
     edge_magnitude = torch.sqrt(torch.sum(edges**2, dim=1, keepdim=True))  # Bx1xHxW
@@ -63,7 +70,6 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
     return blur_score.item()
 
 
-# Generates a consistent hash from the video frames and constructs a cache path.
 def generate_hash_and_cache_path(video_frames: torch.Tensor, key: str) -> Path:
     import hashlib
 
@@ -80,11 +86,12 @@ def generate_hash_and_cache_path(video_frames: torch.Tensor, key: str) -> Path:
 # Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
 # and attempts to load from cache if available. Returns a tensor of scores.
 
+
 def blur_scores(video_frames: List[torch.Tensor], cache_key=None) -> torch.Tensor:
     assert_video_shape(video_frames)
     print(type(video_frames))
     # print ype of first frame
-    print(video_frames[0].shape)
+    print("First frame size", video_frames[0].shape)
 
     # Step 1: Hash video frames for cache key
     cache_path = generate_hash_and_cache_path(video_frames, key="blur_scores_done")
@@ -95,7 +102,7 @@ def blur_scores(video_frames: List[torch.Tensor], cache_key=None) -> torch.Tenso
     else:
         # Step 3: Compute blur scores if cache does not exist
         blur_scores_tensor = torch.tensor(
-            [compute_blur_score_single_frame(frame.unsqueeze(0)) for frame in video_frames], dtype=torch.float32
+            [compute_blur_score_single_frame(frame) for frame in video_frames], dtype=torch.float32
         )  # Compute and convert list to tensor
 
         # Step 4: Save computed blur scores to cache
@@ -303,15 +310,6 @@ def unload_model(model):
         # Clear CUDA cache if model was on GPU
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        # Explicitly call garbage collector
-        import gc
-
-        gc.collect()
-        # Clear CUDA cache if model was on GPU
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
 
 
 def load_video(video_path: str, max_frames: int = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
