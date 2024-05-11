@@ -634,6 +634,16 @@ def train_video(
         batch_depth = []
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
+            pil_frame = Image.fromarray(frame.cpu().numpy(), "RGB")
+            flatten_frame = frame.flatten()
+            wandb.log(
+                {
+                    f"sampled_frame_{frame_index}": wandb.Image(pil_frame),
+                    f"frame_histo_{frame_index}": flatten_frame,  # wandb will make a tensor a histogram
+                },
+                step=False,
+            )
+
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
             camera_rays = rearrange(camera_rays, "c w h -> w h c")
