@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from utils import debug_tensor, histo_tensor
+from utils import debug_tensor
 from einops import rearrange
 
 
@@ -530,7 +530,6 @@ class MoeSpaceTimeModel(nn.Module):
         table_class = lambda: LearnableLookupTable(input_dim=4, index_width=table_width, feature_size=table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
-
         geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_total, inner_activation=True, inner_bias=True)
         table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_total_tables)
         feature_gate = lambda: nn.Linear(scene_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
@@ -607,23 +606,15 @@ class MoeSpaceTimeModel(nn.Module):
         # feature based binning and indexing)
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
 
-        histo_tensor("table_values", all_table_values)
-
         table_features = rearrange(all_table_values, "b e d ->  b (e d)")
         render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
-
-        histo_tensor("render_features", render_features)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
         opacity = torch.relu(opacity)
 
-        histo_tensor("opacity", opacity)
-
         color_input = torch.cat([render_features, origin, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
         color = self.color_feature_layer(color_input)  # Predict color, Bx3
         color = torch.sigmoid(color)
-
-        histo_tensor("color", color)
 
         return torch.cat([color, opacity], dim=-1)  # Return color and opacity, Bx4
 

@@ -80,8 +80,6 @@ def make_camera_rays(
     # histo_tensor("viewport_positions", viewport_positions)
     # histo_tensor("viewport_ray_directions", viewport_ray_directions)
 
-    print("Debug make_camera_rays")
-
     return viewport_positions, viewport_ray_directions
 
 
@@ -279,7 +277,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     sigma = rgba[:, 3]
 
     # histo_tensor("colors", colors)
-    histo_tensor("sigma", sigma)
+    # histo_tensor("sigma", sigma)
 
     # Compute alpha values and weights for color accumulation
     colors = colors.reshape(x.shape)
@@ -609,6 +607,14 @@ def train_video(
 
     depth_maps = video_depth(video_frames, cache_dir="cache", filename=video_path)
 
+    from accelerate import Accelerator
+
+    accelerator = Accelerator()
+    device = accelerator.device
+
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    assert gradient_accumulation_steps > 0, "Gradient accumulation steps must be greater than 0."
+
     i = 0
     for epoch in range(epochs):
         print("Epoch: ", i)
@@ -632,9 +638,6 @@ def train_video(
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
             camera_rays = rearrange(camera_rays, "c w h -> w h c")
 
-            # histo_tensor("camera_poses", camera_poses)
-            # histo_tensor("camera_rays", camera_rays)
-
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
@@ -649,15 +652,10 @@ def train_video(
             batch_colors.append(sampled_colors)
             batch_depth.append(sampled_depth_estimates)
 
-            # There is some rounding in the sampling that can make this not = n_points
             actual_sampled_point_count = sampled_colors.shape[0]
-            print("actual_sampled_point_count", actual_sampled_point_count)
 
-            # Turn index into scaled t va
             t = torch.full((actual_sampled_point_count, 1), frame_index / frame_count, device=device)  # Bx1
             batch_t.append(t)
-
-        # Render all rats as a giant batch
 
         batch_camera_poses = torch.cat(batch_camera_poses, dim=0)
         batch_rays = torch.cat(batch_rays, dim=0)
@@ -682,19 +680,23 @@ def train_video(
         if args.scale_base_loss != 0:
             loss_fn = nn.MSELoss() if args.loss_type == "mse" else nn.HuberLoss()
 
-            # Debug: Check for NaN in inputs to loss function
-            histo_tensor("generated_colors", generated_colors)
             if torch.isnan(generated_colors).any():
                 print("Warning: NaN detected in generated_colors")
-                print(generated_colors)
-            histo_tensor("batch_colors", batch_colors)
             if torch.isnan(batch_colors).any():
                 print("Warning: NaN detected in batch_colors")
-                print(batch_colors)
 
             base_loss = args.scale_base_loss * loss_fn(generated_colors, batch_colors)
 
-            # debug loss
+            # Add histograms of the outputs and ground truth
+            log_data.update(
+                {
+                    "generated_colors(sample)": generated_colors,
+                    "batch_colors(sample)": batch_colors,
+                    "depth(sample)": depth,
+                    "disp(sample)": disp,
+                }
+            )
+
             if torch.isnan(base_loss):
                 print("Warning: NaN detected in base_loss")
 
@@ -711,15 +713,17 @@ def train_video(
             log_data["entropy_loss"] = entropy_loss.item()
 
         if args.scale_depth_loss != 0:
-            depth_loss_fn = nn.MSELoss()  # Assuming depth loss is always MSE
+            depth_loss_fn = nn.MSELoss()
             depth_loss = args.scale_depth_loss * depth_loss_fn(depth, batch_depth)
             total_loss += depth_loss
             log_data["depth_loss"] = depth_loss.item()
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
-        scheduler.step()
+        total_loss /= gradient_accumulation_steps
+        if (epoch + 1) % gradient_accumulation_steps == 0:
+            optimizer.zero_grad()
+            accelerator.backward(total_loss)
+            optimizer.step()
+            scheduler.step()
 
         if epoch % args.validation_steps == 0 and args.should_log_validation_image:
             print("Logging images...")
@@ -806,6 +810,9 @@ def train_style_video(
         scheduler.step()
 
         # log generated colors and depth
+        histo_tensor("generated_colors", generated_colors)
+        histo_tensor("batch_colors", batch_colors)
+
         log_data = {
             "generated_colors": wandb.Image(generated_colors),
             "depth": wandb.Image(depth),
@@ -897,18 +904,18 @@ parser.add_argument("--epochs", type=int, default=200, help="Number of epochs to
 parser.add_argument(
     "--n_points",
     type=int,
-    default=1,
+    default=200,
     help="Number of points to sample for training",
 )
 parser.add_argument(
     "--n_frames",
     type=int,
-    default=1,
+    default=24,
     help="Number of frames to sample from the video",
 )
-parser.add_argument("--validation_steps", type=int, default=40)
+parser.add_argument("--validation_steps", type=int, default=10)
 # bool
-parser.add_argument("--should_log_validation_image", action="store_true", default=False)
+parser.add_argument("--should_log_validation_image", action="store_true", default=True)
 parser.add_argument("--video_validation_steps", type=int, default=50)
 parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to use")
 parser.add_argument(
@@ -944,7 +951,7 @@ parser.add_argument(
 parser.add_argument(
     "--entropy_threshold",
     type=float,
-    default=0.1,
+    default=0.01,
     help="Entropy threshold for entropy loss.",
 )
 parser.add_argument(
@@ -981,7 +988,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale_entropy_loss",
     type=float,
-    default=0.2,
+    default=0.02,
     help="Scaling factor for entropy loss.",
 )
 parser.add_argument(
@@ -1027,6 +1034,13 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Enable noise addition.",
+)
+
+parser.add_argument(
+    "--gradient_accumulation_steps",
+    type=int,
+    default=8,
+    help="Number of gradient accumulation steps.",
 )
 
 args = parser.parse_args()
