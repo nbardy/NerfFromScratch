@@ -643,8 +643,8 @@ def train_video(
             flatten_frame = frame.flatten()
             wandb.log(
                 {
-                    f"sampled_frame_{frame_index}": wandb.Image(pil_frame),
-                    f"frame_histo_{frame_index}": flatten_frame,  # wandb will make a tensor a histogram
+                    f"sampled_frame/frame_{frame_index}": wandb.Image(pil_frame),
+                    f"sampled_frame/histo_{frame_index}": flatten_frame,  # wandb will make a tensor a histogram
                 },
                 step=False,
             )
