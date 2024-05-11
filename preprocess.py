@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from utils import get_default_device
 from torchmetrics.aggregation import RunningMean
+from typing import List
 
 from einops import rearrange
 
@@ -77,7 +78,8 @@ def generate_hash_and_cache_path(video_frames: torch.Tensor, key: str) -> Path:
 
 # Computes the blur score for each frame of a video using Kornia, saves the results as a tensor based on the video frames hash,
 # and attempts to load from cache if available. Returns a tensor of scores.
-def blur_scores(video_frames: list[torch.Tensor], cache_key=None) -> torch.Tensor:
+
+def blur_scores(video_frames: List[torch.Tensor], cache_key=None) -> torch.Tensor:
     assert_video_shape(video_frames)
     print(type(video_frames))
     # print ype of first frame
