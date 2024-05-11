@@ -1,22 +1,23 @@
-import subprocess
-import shutil
-from pathlib import Path
-import kornia as K
-import torchvision
-
-import requests
-import time
 import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import kornia as K
+import requests
 import torch
-from utils import get_default_device
-from tqdm import tqdm
-
-
-from utils import get_default_device
-from torchmetrics.aggregation import RunningMean
-from typing import List
-
+import torchvision
 from einops import rearrange
+from torchmetrics.aggregation import RunningMean
+from utils import get_default_device
+from transformers import AutoFeatureExtractor, Swinv2Model
+
+from safetensors.torch import save_file
+from safetensors import safe_open
+from pathlib import Path
+from tqdm.auto import tqdm
 
 
 # Define a global dictionary to cache models
@@ -154,12 +155,6 @@ model_cache = {}
 
 # Process video frames using Swin Transformer model for features and store them using SafeTensors
 def process_video_frames(video_frames):
-    from transformers import AutoFeatureExtractor, Swinv2Model
-    import torch
-    from safetensors.torch import save_file
-    from safetensors import safe_open
-    from pathlib import Path
-    from tqdm.auto import tqdm
 
     assert_video_shape(video_frames)
 
@@ -226,7 +221,7 @@ def process_video_frames(video_frames):
 from einops import rearrange, reduce
 
 
-def get_image_feature_difference_scores(video_frames: list[torch.Tensor]) -> torch.Tensor:
+def get_image_feature_difference_scores(video_frames: List[torch.Tensor]) -> torch.Tensor:
     """
     Calculates and returns a single value representing the average feature difference score
 
@@ -317,10 +312,6 @@ def unload_model(model):
             torch.cuda.empty_cache()
 
 
-from einops import rearrange
-from fractions import Fraction
-from typing import Tuple, Dict, Any
-import torch
 
 
 def load_video(video_path: str, max_frames: int = None) -> Tuple[torch.Tensor, Dict[str, Any]]:

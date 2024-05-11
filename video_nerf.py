@@ -1046,7 +1046,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 if __name__ == "__main__":
-    video_path = "/Users/nicholasbardy/Downloads/baja_room_nerf.mp4"
+    video_path = "output_small.mp4"
     video_frames = load_video(video_path, max_frames=args.max_frames)
 
     # pretty print args with names
