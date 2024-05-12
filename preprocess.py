@@ -42,9 +42,9 @@ def assert_video_shape(video_frames: torch.Tensor):
     assert isinstance(video_frames, torch.Tensor)
     # shape *, H, W, 3 | where H > 280, W > 280, * > 20
     assert len(video_frames.shape) == 4, f"Expect 4 dimensions. Got {len(video_frames.shape)} dimensions"
-    assert video_frames.shape[1] > 280, f"Expect height to be greater than 280. Got {video_frames.shape[1]}"
-    assert video_frames.shape[2] > 280, f"Expect width to be greater than 280. Got {video_frames.shape[2]}"
-    assert video_frames.shape[0] > 20, f"Expect frames to be greater than 20. Got {video_frames.shape[0]}"
+    assert video_frames.shape[1] > 280, f"Expect height to be greater than 280. Got {video_frames.shape[1]}\n Full shape: {video_frames.shape}"
+    assert video_frames.shape[2] > 280, f"Expect width to be greater than 280. Got {video_frames.shape[2]}\n Full shape: {video_frames.shape}"
+    assert video_frames.shape[0] > 20, f"Expect frames to be greater than 20. Got {video_frames.shape[0]}\n Full shape: {video_frames.shape}"
 
     print("vfs", video_frames.shape)
 
@@ -325,6 +325,41 @@ def load_video(video_path: str, max_frames: int = None) -> Tuple[torch.Tensor, D
         video_frames = video_frames[:max_frames]  # Trim to max_frames if specified # F'xHxWxC
 
     assert_video_shape(video_frames)
+
+    import wandb
+    from PIL import Image
+    from einops import rearrange
+
+    # [F, H, W, C]
+    print("shape", video_frames.shape)  # Debug print to check the shape of video frames
+    print("frame 0 shape", video_frames[0].shape)  # [H, W, C]
+
+    import numpy as np
+
+    # Log the first 10 frames to wandb
+    def to_pil_image(frame):
+        # If the frame has a single dimension, expand it to three dimensions
+        if len(frame.shape) == 1:
+            frame = frame.unsqueeze(0).unsqueeze(0)
+
+        # If the frame has two dimensions, expand it to three dimensions
+        elif len(frame.shape) == 2:
+            frame = frame.unsqueeze(0)
+
+        # Ensure the frame has a valid shape and data type
+        assert len(frame.shape) == 3, f"Invalid frame shape: {frame.shape}"
+        assert frame.dtype == torch.float32, f"Invalid frame data type: {frame.dtype}"
+
+        # Convert the frame to a NumPy array and scale the values to [0, 255]
+        frame_np = (frame.numpy() * 255).astype(np.uint8)
+
+        # Convert the frame to a PIL image
+        return Image.fromarray(frame_np)
+
+    pil_images = [to_pil_image(video_frames[i]) for i in range(min(10, len(video_frames)))]
+    wandb.log({"video_frames/image": [wandb.Image(pil_images[i]) for i in range(len(pil_images))]}, commit=False)
+    wandb.log({"video_frames/histo": [video_frames[i].flatten() for i in range(len(pil_images))]}, commit=False)
+
     return video_frames
 
 

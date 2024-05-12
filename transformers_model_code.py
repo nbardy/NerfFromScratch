@@ -139,7 +139,7 @@ class SpaceTimeTransformerEncoder(nn.Module):
 
 # A standard transformer that embeds the input and evals layers and projects to final size
 class TransformerEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim, inner_dim=64, model_depth=1):
+    def __init__(self, input_dim, output_dim, model_depth=1):
         super().__init__()
         embedding_depth = 8
         projection_dim = 8

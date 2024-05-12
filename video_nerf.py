@@ -270,7 +270,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     # for input in zip([flat_x, flat_times, flat_origin], ["flat_x", "flat_times", "flat_origin"]):
     #     histo_tensor(input[1], input[0])
     # Print the hist
-    rgba = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
+    rgba, features = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
     # check for nan if nan print tensor
 
     colors = rgba[:, :3]
@@ -310,7 +310,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     weight_sum = weights.sum(-1).sum(-1)
     disp = 1.0 / torch.max(1e-10 * torch.ones_like(depth), depth / weight_sum)
 
-    return c, regularization, depth, disp
+    return c, regularization, depth, disp, features
 
 
 def compute_style_loss(batch_output, depth, args):
@@ -577,7 +577,6 @@ def train_video(
     assert args is not None
 
     ## Load Assets
-    wandb.init(project="3D_nerf")
 
     device = get_default_device()
     video_frames = load_video(video_path, max_frames=max_frames)
@@ -586,6 +585,12 @@ def train_video(
 
     camera_position = LearnableCameraPosition(n_frames=len(video_frames))
     scene_function = get_model(args.model)
+
+    clip_feature_size = 228
+
+    # Small model to project the NERF model inner hidden states to a clip feature
+    # This let's us bind to a clip vector for semantic region based editing
+    project_feature_to_clip = nn.Linear(scene_function.feature_size, clip_feature_size)
 
     optimizer = torch.optim.Adam(
         list(scene_function.parameters()) + list(camera_position.parameters()),
@@ -637,16 +642,17 @@ def train_video(
         batch_t = []
         batch_colors = []
         batch_depth = []
+        batch_features = []
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
-            pil_frame = Image.fromarray(frame.cpu().numpy(), "RGB")
+            pil_frame = Image.fromarray(frame.cpu().numpy() * 255, "RGB")
             flatten_frame = frame.flatten()
             wandb.log(
                 {
                     f"sampled_frame/frame_{frame_index}": wandb.Image(pil_frame),
                     f"sampled_frame/histo_{frame_index}": flatten_frame,  # wandb will make a tensor a histogram
                 },
-                step=False,
+                commit=False,
             )
 
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
@@ -655,8 +661,14 @@ def train_video(
 
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates = sample_n_points_from_tensors(
-                [frame, camera_poses, camera_rays, frame_depth_estimate],
+            # TODO: Add the pixel level clip code for this
+            def get_feature_map(video_path, frame, frame_index, args):
+                return torch.ones_like(frame)
+
+            features = get_feature_map(video_path, frame, frame_index, args)
+
+            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates, sampled_features = sample_n_points_from_tensors(
+                [frame, camera_poses, camera_rays, frame_depth_estimate, features],
                 n_points,
                 size,
                 boost_edge=args.boost_edge,
@@ -666,6 +678,7 @@ def train_video(
             batch_rays.append(sampled_rays)
             batch_colors.append(sampled_colors)
             batch_depth.append(sampled_depth_estimates)
+            batch_features.append(sampled_features)
 
             actual_sampled_point_count = sampled_colors.shape[0]
 
@@ -677,8 +690,9 @@ def train_video(
         batch_colors = torch.cat(batch_colors, dim=0)
         batch_t = torch.cat(batch_t, dim=0)
         batch_depth = torch.cat(batch_depth, dim=0)
+        batch_features = torch.cat(batch_features, dim=0)
 
-        generated_colors, entropy_regularization, depth, disp = render_rays(
+        generated_colors, entropy_regularization, depth, disp, generated_features = render_rays(
             scene_function,
             batch_camera_poses,
             batch_rays,
@@ -732,6 +746,13 @@ def train_video(
             depth_loss = args.scale_depth_loss * depth_loss_fn(depth, batch_depth)
             total_loss += depth_loss
             log_data["depth_loss"] = depth_loss.item()
+
+        if args.add_feature_mapping:
+            projected_features = project_feature_to_clip(generated_features)
+            feature_mapping_loss = nn.MSELoss()(projected_features, batch_features)
+            feature_mapping_loss = args.scale_feature_loss * feature_mapping_loss
+            total_loss += feature_mapping_loss
+            log_data["feature_mapping_loss"] = feature_mapping_loss
 
         total_loss /= gradient_accumulation_steps
         if (epoch + 1) % gradient_accumulation_steps == 0:
@@ -844,12 +865,14 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
 
     camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=t_val)
     image_tensor = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)  # BxCxHxW
-    image_pil = Image.fromarray(image_tensor.cpu().numpy(), "RGB")
+    image_pil = Image.fromarray(image_tensor.cpu().numpy() * 255, "RGB")
     gt_frame = video_frames[t_val]
 
     log_data[f"{prefix}_predicted"] = wandb.Image(image_pil)
-    gt_frame_pil = Image.fromarray(gt_frame.cpu().numpy(), "RGB")
+    log_data[f"{prefix}_predicted_histo"] = image_tensor
+    gt_frame_pil = Image.fromarray(gt_frame.cpu().numpy() * 255, "RGB")
     log_data[f"{prefix}_ground truth"] = wandb.Image(gt_frame_pil)
+    log_data[f"{prefix}_ground_truth_histo"] = gt_frame
     return log_data
 
 
@@ -933,7 +956,7 @@ parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to
 parser.add_argument(
     "--max_frames",
     type=int,
-    default=None,
+    default=40,
     help="Maximum number of frames to use for training and inference.",
 )
 parser.add_argument(
@@ -960,6 +983,7 @@ parser.add_argument(
     default=True,
     help="Enable entropy loss regularization.",
 )
+parser.add_argument("---add_feature_mapping", action="store_true", default=False, help="Add loss for features")
 parser.add_argument(
     "--entropy_threshold",
     type=float,
@@ -1058,6 +1082,8 @@ parser.add_argument(
 args = parser.parse_args()
 
 if __name__ == "__main__":
+    wandb.init(project="3D_nerf")
+
     video_path = "output_small.mp4"
     video_frames = load_video(video_path, max_frames=args.max_frames)
 

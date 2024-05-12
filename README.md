@@ -22,7 +22,7 @@ Currently the code is not running as a did a major overhaul to add all the featu
 - [x] Add fast mobile transformer instead of MLP[In progess, code is in repo haven't tested on NERFs)(Probably ditch this in favor of lookup tables)
 - [x] Lookup table inspired by instantNGP
 - [x] Add spacetime lookup tables
-      
+
 #### Expand Spacetime Handling
 
 - [x] Add Space time geometry projection to project arbitrary scene geometry to cube based 3D lookup tables (Geometric Projection to lookup table index)
@@ -48,6 +48,10 @@ Currently the code is not running as a did a major overhaul to add all the featu
 - [x] CLIP based pixel style loss
 - [x] CLIP based geometry style loss on depth maps[1]
 
+### Feature learning for editing
+
+- [x] Adds a clip grounded pixel based loss for tying semantic information to editing (TOOD: Add ref)
+
 #### Training Speedups
 
 - [x] Shoot more rays at edges in images (TODO: Add paper ref)
@@ -56,6 +60,7 @@ Currently the code is not running as a did a major overhaul to add all the featu
 - [] (TODO): Use actual CUDA kernels from instant-NGP(Although these won't be spacetime compatible)(The torch tables may be fast enough)
 
 [1] https://hyblue.github.io/geo-srf/
+
 ### Logs
 
 Logs are currently going to weights and biases logs here:

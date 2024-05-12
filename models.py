@@ -142,29 +142,6 @@ class LearnableLookupTable(nn.Module):
         return self.forward_without_scale(scaled_indices)
 
 
-def lookup_neighbors(base_idx, neighbor_offsets, table):
-    """
-    Fetches and flattens neighbor features from a given lookup table.
-
-    Parameters:
-    - base_idx: Tensor of base indices for lookup.
-    - neighbor_offsets: List of tuples representing the offset ranges for each dimension.
-    - table: The lookup table from which features are fetched.
-
-    Returns:
-    - Flattened tensor of neighbor features.
-    """
-    neighbor_features = []
-    for offset in neighbor_offsets:
-        # Calculate neighbor index with wrap-around for each dimension
-        neighbor_idx = (base_idx + torch.tensor(offset, device=base_idx.device)) % torch.tensor(table.dims, device=base_idx.device)
-        neighbor_features.append(table(neighbor_idx))
-
-    # Concatenate and flatten the neighbor features
-    neighbor_features = torch.cat(neighbor_features, dim=-1).flatten(start_dim=1)
-    return neighbor_features
-
-
 class RMSNorm(nn.Module):
     def __init__(self, d, p=-1.0, eps=1e-8, bias=False):
         """
@@ -491,6 +468,8 @@ class MoeSpaceTimeModel(nn.Module):
         num_geo_default_experts = 1
         num_geo_experts_chosen = 1
 
+        geo_feature_size = 8
+
         # table_size = (64, 64, 64, 128)
         # table_feature_size = 16
         # num_total_tables = 16
@@ -515,15 +494,20 @@ class MoeSpaceTimeModel(nn.Module):
         num_active_tables = num_geo_experts_chosen + num_table_experts_chosen
         scene_feature_size = num_active_tables * table_feature_size
 
+        self.feature_size = render_feature_size + geo_feature_size / 2
+
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
         # Output dim is 8 because we split it into 2x4 for two different 4 dim features
-        geo_class = lambda: (SpaceTimeTransformerEncoder(output_dim=8, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=8))
+        geo_class = lambda: (
+            SpaceTimeTransformerEncoder(output_dim=geo_feature_size, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=8)
+        )
         print("---")
         print(f"scene_feature_size = {scene_feature_size}")
         print("---")
+        self.feature_size
         render_class = lambda: (
-            TransformerEncoder(model_depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
+            TransformerEncoder(model_depth=2, input_dim=self.feature_size, output_dim=render_feature_size)
             if use_attention_render
             else SegGLUMLP(depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
         )
@@ -531,7 +515,7 @@ class MoeSpaceTimeModel(nn.Module):
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
         geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_total, inner_activation=True, inner_bias=True)
-        table_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_total_tables)
+        table_gate = lambda: SegGLUMLP(geo_feature_size / 2, inner_dim=8, output_dim=num_total_tables)
         feature_gate = lambda: nn.Linear(scene_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
         self.geometric_layer = MoeLayer(
@@ -575,8 +559,8 @@ class MoeSpaceTimeModel(nn.Module):
         #
         # Retrieve opacity first
         self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
-        # We append the ray origin and the opacity to the original feature and compute color separately
-        self.color_feature_layer = nn.Linear(render_feature_size + 3 + 1, 3)
+        # We append geo_feature ray origin and the opacity to the original feature and compute color separately
+        self.color_feature_layer = nn.Linear(render_feature_size, 3)
 
     def forward(self, point=None, origin=None, time=None):
         """
@@ -593,6 +577,8 @@ class MoeSpaceTimeModel(nn.Module):
         # Concatenate position and time along the feature dimension
         x = torch.cat([pos, t], dim=1)  # Bx(C+1)
         all_geometric = self.geometric_layer(inputs=x)  # Process through geometric layer
+        # The first geometric is used as a general
+        # The second geometric feature is used as an index for the table
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
 
         # We want the data selection to be based on a different geometry than the table index
@@ -607,7 +593,8 @@ class MoeSpaceTimeModel(nn.Module):
         all_table_values = self.table_moe(gate_inputs=geo_features_1, inputs=geo_features_2)  # Process summed geometric features through table MoE
 
         table_features = rearrange(all_table_values, "b e d ->  b (e d)")
-        render_features = self.render_layer(inputs=table_features)  # Process through render layer, Bx(num_render_experts*4)
+        features = torch.cat([table_features, geo_features_1], dim=-1)
+        render_features = self.render_layer(inputs=features)  # Process through render layer, Bx(num_render_experts*4)
 
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
         opacity = torch.relu(opacity)
@@ -616,7 +603,7 @@ class MoeSpaceTimeModel(nn.Module):
         color = self.color_feature_layer(color_input)  # Predict color, Bx3
         color = torch.sigmoid(color)
 
-        return torch.cat([color, opacity], dim=-1)  # Return color and opacity, Bx4
+        return torch.cat([color, opacity], dim=-1), features  # Return color and opacity, Bx4
 
 
 def get_model(model_name, input_dim=6):
