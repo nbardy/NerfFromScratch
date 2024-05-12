@@ -20,6 +20,7 @@ from depth import video_depth
 from style import embed_text, embed_image
 
 from preprocess import assert_video_shape
+from pixel_features import get_feature_map_fake, get_feature_map
 
 camera_depth = 0.2
 
@@ -661,11 +662,7 @@ def train_video(
 
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            # TODO: Add the pixel level clip code for this
-            def get_feature_map(video_path, frame, frame_index, args):
-                return torch.ones_like(frame)
-
-            features = get_feature_map(video_path, frame, frame_index, args)
+            features = get_feature_map_fake(video_path, frame, frame_index, args)
 
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates, sampled_features = sample_n_points_from_tensors(
                 [frame, camera_poses, camera_rays, frame_depth_estimate, features],
