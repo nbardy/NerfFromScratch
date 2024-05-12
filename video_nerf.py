@@ -205,8 +205,12 @@ def sample_n_points_from_tensors(
     x_coords = combined_indices % viewport_size[1]
 
     for tensor in image_tensors:
+        scale_y = viewport_size[0] / tensor.shape[0]
+        scale_x = viewport_size[1] / tensor.shape[1]
+        rescaled_y = y_coords * scale_y
+        rescaled_x = x_coords * scale_x
         # Sample colors from tensor using the generated indices
-        sampled_tensor_values = tensor[y_coords, x_coords, :]  # CxN
+        sampled_tensor_values = tensor[rescaled_y, rescaled_x, :]  # CxN
         # Move the batch to the last dim
         # sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
         sampled_values.append(sampled_tensor_values)

@@ -32,6 +32,8 @@ def get_feature_map(frame):
         mask_pixels = mask["mask_pixels"]
         feature_vals = pixel_feature_map * mask_pixels
         # mean across pixels
+        feature_vals = feature_vals.drop_outliers(0.2)
+        # TODO: Accross pixels
         pooled = feature_vals.mean(dim=1)
         smoothed_map = pooled * 0.8 + feature_vals * 0.2
         final += smoothed_map
