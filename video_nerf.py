@@ -921,7 +921,7 @@ def inference_nerf(
         batch_positions = camera_positions_flat[start_idx:end_idx, :]
         batch_rays = camera_rays_flat[start_idx:end_idx, :]
         batch_times = t[start_idx:end_idx, :]
-        rgba = model(point=batch_positions, time=batch_times, origin=batch_rays)
+        rgba, features = model(point=batch_positions, time=batch_times, origin=batch_rays)
         colors = rgba[:, :3]
         generated_colors[start_idx:end_idx, :] = colors
 

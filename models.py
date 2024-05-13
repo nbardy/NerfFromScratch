@@ -468,7 +468,7 @@ class MoeSpaceTimeModel(nn.Module):
         num_geo_default_experts = 1
         num_geo_experts_chosen = 1
 
-        geo_feature_size = 8
+        full_geo_feature_size = 8
 
         # table_size = (64, 64, 64, 128)
         # table_feature_size = 16
@@ -494,18 +494,20 @@ class MoeSpaceTimeModel(nn.Module):
         num_active_tables = num_geo_experts_chosen + num_table_experts_chosen
         scene_feature_size = num_active_tables * table_feature_size
 
-        single_geo_feature_size = geo_feature_size // 2
-        self.feature_size = scene_feature_size + geo_feature_size // 2
+        single_geo_feature_size = full_geo_feature_size // 2
+        self.feature_size = scene_feature_size + full_geo_feature_size // 2
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
         # Output dim is 8 because we split it into 2x4 for two different 4 dim features
         geo_class = lambda: (
-            SpaceTimeTransformerEncoder(output_dim=geo_feature_size, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=geo_feature_size)
+            SpaceTimeTransformerEncoder(output_dim=full_geo_feature_size, model_depth=2)
+            if use_attention_geo
+            else SpacetimeGeometricMLP(output_dim=full_geo_feature_size)
         )
 
         print("---")
-        print(f"geo_feature_size          = {geo_feature_size}")
+        print(f"geo_feature_size          = {full_geo_feature_size}")
         print(f"single_geo_feature_size   = {single_geo_feature_size}")
         print(f"scene_feature_size        = {scene_feature_size}")
         print(f"feature_size              = {self.feature_size}")
@@ -565,7 +567,8 @@ class MoeSpaceTimeModel(nn.Module):
         # Retrieve opacity first
         self.alpha_feature_layer = nn.Linear(render_feature_size, 1)
         # We append geo_feature ray origin and the opacity to the original feature and compute color separately
-        self.color_feature_layer = nn.Linear(render_feature_size, 3)
+        ray_origin_size, sigma_size = 3, 1
+        self.color_feature_layer = nn.Linear(render_feature_size + ray_origin_size + sigma_size, 3)
 
     def forward(self, point=None, origin=None, time=None):
         """
@@ -585,6 +588,16 @@ class MoeSpaceTimeModel(nn.Module):
         # The first geometric is used as a general
         # The second geometric feature is used as an index for the table
         geo_features_1, geo_features_2 = all_geometric.chunk(2, dim=-1)  # Split geometric features into two tensors
+
+        import wandb
+
+        wandb.log(
+            {
+                "geo_features_1": geo_features_1,
+                "geo_features_2": geo_features_2,
+            },
+            commit=False,
+        )
 
         # We want the data selection to be based on a different geometry than the table index
         # So we gate, Gating on the index values would be too limiting since the values from
@@ -610,6 +623,13 @@ class MoeSpaceTimeModel(nn.Module):
         color = self.color_feature_layer(color_features)  # Predict color, Bx3
         color = torch.sigmoid(color)
 
+        wandb.log(
+            {
+                "color": color,
+                "opacity": opacity,
+            },
+            commit=False,
+        )
         return torch.cat([color, opacity], dim=-1), features  # Return color and opacity, Bx4
 
 
