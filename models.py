@@ -448,7 +448,8 @@ class MoeLayer(nn.Module):
             # debug_tensor("batch_idx", batch_idx)
             # debug_tensor("nth_expert", nth_expert)
             # debug_tensor("inputs", inputs)
-            results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), inputs.shape[0])
+            if batch_idx.shape[0] > 0:
+                results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), inputs.shape[0])
 
         return results
 
@@ -641,19 +642,19 @@ class MoeSpaceTimeModel(nn.Module):
 class MoeSpaceTimeModelSimple(nn.Module):
     def __init__(self):
         super(MoeSpaceTimeModelSimple, self).__init__()
-        expert_feature_size = 8
+        expert_feature_size = 32
         total_experts = 128
 
         self.expert_mlps = MoeLayer(
             expert_class=lambda: MLP(input_dim=4, inner_dim=16, output_dim=expert_feature_size, depth=2),
-            gate=lambda: MLP(input_dim=4, inner_dim=4, output_dim=total_experts, depth=1),
+            gate=MLP(input_dim=4, inner_dim=4, output_dim=total_experts, depth=1),
             moe_args=MoeArgs(
                 num_experts=total_experts,
                 num_selected_experts=4,
                 num_default_experts=4,
             ),
         )
-        self.feature_size = expert_feature_size * (4 + 4)
+        self.feature_size = expert_feature_size
         self.alpha_feature_layer = nn.Linear(self.feature_size, 1)
         self.color_feature_layer = nn.Linear(self.feature_size + 3 + 1, 3)
 
@@ -665,6 +666,7 @@ class MoeSpaceTimeModelSimple(nn.Module):
         assert t is not None, "t is None"
 
         x = torch.cat([pos, t], dim=1)
+
         features = self.expert_mlps(x)
 
         # Predict opacity, Bx1

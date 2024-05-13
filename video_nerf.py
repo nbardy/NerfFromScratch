@@ -482,10 +482,19 @@ def sample_with_scores_and_runs(
     uniform_indices = torch.randperm(len(video_frames))[:n_uniform].to(video_frames[0].device)
 
     # Sampling based on differences (maximized)
-    diff_indices = torch.argsort(torch.tensor(differences, device=video_frames[0].device), descending=True)[:n_diff]
+    # Convert differences and blur_scores to tensors if not already, then sort
+    if not isinstance(differences, torch.Tensor):
+        differences = torch.tensor(differences, device=video_frames[0].device)
 
-    # Sampling based on minimal blur
-    blur_indices = torch.argsort(torch.tensor(blur_scores, device=video_frames[0].device))[:n_blur]
+    # Weighted sampling based on differences
+    diff_weights = torch.softmax(differences, dim=0)
+    diff_indices = torch.multinomial(diff_weights, n_diff, replacement=False)
+
+    if not isinstance(blur_scores, torch.Tensor):
+        blur_scores = torch.tensor(blur_scores, device=video_frames[0].device)
+    # Weighted sampling based on minimal blur (invert blur scores for weighting)
+    blur_weights = torch.softmax(-blur_scores, dim=0)
+    blur_indices = torch.multinomial(blur_weights, n_blur, replacement=False)
 
     # Clustered sampling with exponential offset pattern
     cluster_indices = torch.empty(0, dtype=torch.int, device=video_frames[0].device)
@@ -507,6 +516,11 @@ def sample_with_scores_and_runs(
     # Ensure the number of cluster frames is exactly n_cluster by randomly selecting if over
     if cluster_indices.numel() > n_cluster:
         cluster_indices = cluster_indices[torch.randperm(cluster_indices.numel())[:n_cluster]]
+
+    print("uniform_indices device", uniform_indices.device)
+    print("diff_indices device", diff_indices.device)
+    print("blur_indices device", blur_indices.device)
+    print("cluster_indices device", cluster_indices.device)
 
     all_indices = torch.cat((uniform_indices, diff_indices, blur_indices, cluster_indices))
     unique_indices = torch.unique(all_indices)
@@ -1118,6 +1132,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 if __name__ == "__main__":
+    device = get_default_device()
     wandb.init(project="3D_nerf")
 
     video_path = "output_small.mp4"
@@ -1134,6 +1149,8 @@ if __name__ == "__main__":
 
     if args.weight_blur_and_difference:
         blur_scores = blur_scores(video_frames)
+        blur_scores = blur_scores.to(device)
+
         differences = get_image_feature_difference_scores(video_frames)
         # else none
     else:
