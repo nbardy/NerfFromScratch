@@ -935,13 +935,13 @@ parser.add_argument("--epochs", type=int, default=200, help="Number of epochs to
 parser.add_argument(
     "--n_points",
     type=int,
-    default=200,
+    default=400,
     help="Number of points to sample for training",
 )
 parser.add_argument(
     "--n_frames",
     type=int,
-    default=24,
+    default=60,
     help="Number of frames to sample from the video",
 )
 parser.add_argument("--validation_steps", type=int, default=10)
@@ -952,7 +952,7 @@ parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to
 parser.add_argument(
     "--max_frames",
     type=int,
-    default=40,
+    default=400000,
     help="Maximum number of frames to use for training and inference.",
 )
 parser.add_argument(
@@ -983,7 +983,7 @@ parser.add_argument("---add_feature_mapping", action="store_true", default=False
 parser.add_argument(
     "--entropy_threshold",
     type=float,
-    default=0.01,
+    default=0.2,
     help="Entropy threshold for entropy loss.",
 )
 parser.add_argument(
@@ -1071,7 +1071,7 @@ parser.add_argument(
 parser.add_argument(
     "--gradient_accumulation_steps",
     type=int,
-    default=8,
+    default=64,
     help="Number of gradient accumulation steps.",
 )
 
