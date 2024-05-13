@@ -650,15 +650,8 @@ def train_video(
         batch_features = []
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
-            pil_frame = Image.fromarray(frame.cpu().numpy() * 255, "RGB")
+            pil_frame = Image.fromarray((frame.cpu().numpy() * 255).astype(np.uint8), "RGB")
             flatten_frame = frame.flatten()
-            wandb.log(
-                {
-                    f"sampled_frame/frame_{frame_index}": wandb.Image(pil_frame),
-                    f"sampled_frame/histo_{frame_index}": flatten_frame,  # wandb will make a tensor a histogram
-                },
-                commit=False,
-            )
 
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
@@ -866,14 +859,16 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
 
     camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=t_val)
     image_tensor = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)  # BxCxHxW
-    image_pil = Image.fromarray(image_tensor.cpu().numpy() * 255, "RGB")
+    image_pil = Image.fromarray((image_tensor.cpu().numpy() * 255).astype(np.uint8), "RGB")
     gt_frame = video_frames[t_val]
 
-    log_data[f"{prefix}_predicted"] = wandb.Image(image_pil)
-    log_data[f"{prefix}_predicted_histo"] = image_tensor
-    gt_frame_pil = Image.fromarray(gt_frame.cpu().numpy() * 255, "RGB")
-    log_data[f"{prefix}_ground truth"] = wandb.Image(gt_frame_pil)
-    log_data[f"{prefix}_ground_truth_histo"] = gt_frame
+    if prefix is not None:
+        prefix = prefix + "/"
+    log_data[f"{prefix}predicted"] = wandb.Image(image_pil)
+    log_data[f"{prefix}predicted_histo"] = image_tensor
+    gt_frame_pil = Image.fromarray((gt_frame.cpu().numpy() * 255).astype(np.uint8), "RGB")
+    log_data[f"{prefix}ground truth"] = wandb.Image(gt_frame_pil)
+    log_data[f"{prefix}ground_truth_histo"] = gt_frame
     return log_data
 
 
