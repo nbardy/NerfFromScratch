@@ -215,7 +215,9 @@ def sample_n_points_from_tensors(
         # sampled_tensor_values = sampled_tensor_values.swapaxes(0, 1)  # NxC
         sampled_values.append(sampled_tensor_values)
 
-    return sampled_values
+    # Also retun a list of [x,y coords]
+    xys = list(zip(x_coords, y_coords))
+    return sampled_values, xys
 
 
 def transmittance(alphas):
@@ -536,6 +538,8 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
     sampled_frames = []
     indices = []
     if not args.weight_blur_and_difference:
+        print("== sampling ==")
+        print("Sampling with uniform")
         sampled_frames, sampled_indices = sample_uniform_with_runs(
             video_frames,
             n_frames,
@@ -543,6 +547,8 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
         )
         indices += sampled_indices
     else:
+        print("== sampling ==")
+        print("Sampling with weighted")
         assert blur_scores is not None, "Blur scores are required for weighted sampling."
         assert differences is not None, "Differences are required for weighted sampling."
 
@@ -556,6 +562,8 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
         indices += sampled_indices
 
     if args.sample_long_temporal:
+        print("== sampling ==")
+        print("Sampling with long temporal")
         long_temporal_indices = sample_exponential_clusters(len(video_frames), 11, 8, 5, 10)
         long_temporal_frames = [video_frames[i] for i in long_temporal_indices.tolist()]
         sampled_frames += long_temporal_frames
@@ -642,16 +650,34 @@ def train_video(
             blur_scores=blur_scores,
             args=args,
         )
+
+        # list to tensor
+        debug_sampled_frames = torch.stack(sampled_frames, dim=0)
+        debug_sampled_indices = torch.stack(sampled_indices, dim=0)
+        frame_count = video_frames.shape[0]
+        wandb.log(
+            {
+                "frame_sampling/sampled_frames": debug_sampled_frames,
+                "frame_sampling/sampled_indices": debug_sampled_indices,
+                "frame_sampling/max_frames": max_frames,
+                "frame_sampling/frame_count_sampled": frame_count,
+            },
+            commit=False,
+        )
         batch_camera_poses = []
         batch_rays = []
         batch_t = []
         batch_colors = []
         batch_depth = []
         batch_features = []
+        batch_flatten_frame_debug = []
 
         for frame_index, frame in zip(sampled_indices, sampled_frames):
             pil_frame = Image.fromarray((frame.cpu().numpy() * 255).astype(np.uint8), "RGB")
+
+            # debug
             flatten_frame = frame.flatten()
+            batch_flatten_frame_debug.append(flatten_frame)
 
             camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
@@ -661,11 +687,22 @@ def train_video(
 
             features = get_feature_map_fake(frame)
 
-            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates, sampled_features = sample_n_points_from_tensors(
+            values, indices = sample_n_points_from_tensors(
                 [frame, camera_poses, camera_rays, frame_depth_estimate, features],
                 n_points,
                 size,
                 boost_edge=args.boost_edge,
+            )
+            sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates, sampled_features = values
+            # Convert list of tuples to a list of tensors
+
+            # flatten
+            wandb.log(
+                {
+                    f"debug_frame/flatten_frame_{frame_index}": flatten_frame,
+                    f"debug_frame/frame_image_{frame_index}": wandb.Image(pil_frame),
+                },
+                commit=False,
             )
 
             batch_camera_poses.append(sampled_poses)
@@ -862,8 +899,11 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     image_pil = Image.fromarray((image_tensor.cpu().numpy() * 255).astype(np.uint8), "RGB")
     gt_frame = video_frames[t_val]
 
-    if prefix is not None:
+    if not prefix:
+        prefix = ""
+    else:
         prefix = prefix + "/"
+
     log_data[f"{prefix}predicted"] = wandb.Image(image_pil)
     log_data[f"{prefix}predicted_histo"] = image_tensor
     gt_frame_pil = Image.fromarray((gt_frame.cpu().numpy() * 255).astype(np.uint8), "RGB")
@@ -948,7 +988,7 @@ parser.add_argument("--validation_steps", type=int, default=10)
 # bool
 parser.add_argument("--should_log_validation_image", action="store_true", default=True)
 parser.add_argument("--video_validation_steps", type=int, default=50)
-parser.add_argument("--model", type=str, default="moe-spacetime", help="Model to use")
+parser.add_argument("--model", type=str, default="moe-spacetime-simple", help="Model to use")
 parser.add_argument(
     "--max_frames",
     type=int,

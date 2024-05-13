@@ -26,7 +26,10 @@ class GEGLU(nn.Module):
 
 
 class SphericalEmbedding(nn.Module):
-    def __init__(self, dim=8, depth=8):
+    def __init__(self, input_dim=3, dim=8, depth=8):
+        if input_dim != 3:
+            raise ValueError("Input dimension must be 3")
+
         super(SphericalEmbedding, self).__init__()
         # fmt: off
         self.projection_dim     = dim
@@ -34,7 +37,12 @@ class SphericalEmbedding(nn.Module):
         self.centers            = nn.Parameter(torch.randn(depth, 3))  # Initialize center points, D x 3
         self.random_projection  = nn.Parameter(torch.randn(depth, 3, dim))  # Random projection matrix, D x 3 x P
 
-    def forward(self, x):
+    def forward(self, x, center_shift=None, spherical_scale=None, spherical_shift=None):
+
+        # Shift center point
+        if center_shift is not None:
+            x = x + center_shift
+
         assert x.shape[-1] == 3, "Input must be Bx3"
         assert len(x.shape) == 2, "Input must be a 2D tensor"
 
@@ -45,16 +53,22 @@ class SphericalEmbedding(nn.Module):
         phi   = torch.atan2(x_expanded[:, :, 1], x_expanded[:, :, 0])  # Azimuth angle, B x D
         theta = torch.acos(x_expanded[:, :, 2] / rho.squeeze(-1))  # Polar angle, B x D
 
+
         spherical_coords = torch.stack([rho.squeeze(-1), phi, theta], dim=-1)  # Stack to spherical coordinates, B x D x 3
+        # Shift and scale spherical coordinates
+        if spherical_shift is not None:
+            spherical_coords = spherical_coords + spherical_shift
+        if spherical_scale is not None:
+            spherical_coords = spherical_coords * spherical_scale
         projected        = torch.einsum("bdi,dij->bdj", spherical_coords, self.random_projection)  # Project to embedding, B x D x P
 
         return projected
 
 
 class AngleEmbedding(nn.Module):
-    def __init__(self, input_dim, projection_dim=8, depth=8):
+    def __init__(self, input_dim, dim=8, depth=8):
         super(AngleEmbedding, self).__init__()
-        self.projection_dim = projection_dim
+        self.projection_dim = dim
         self.input_dim = input_dim
         self.depth = depth
         # Adjusted to create a depth-wise projection matrix
@@ -105,7 +119,7 @@ class SpaceTimeEmbedding(nn.Module):
         spherical_embedding_dim = depth - 1
         time_embedding_dim = 1
         self.spherical_embedding = SphericalEmbedding(dim=projection_dim, depth=spherical_embedding_dim)
-        self.angle_embedding = AngleEmbedding(input_dim=1, projection_dim=projection_dim, depth=time_embedding_dim)
+        self.angle_embedding = AngleEmbedding(input_dim=1, dim=projection_dim, depth=time_embedding_dim)
 
     def forward(self, xyzt):
         xyz, t = torch.split(xyzt, [3, 1], dim=-1)
@@ -139,7 +153,7 @@ class SpaceTimeTransformerEncoder(nn.Module):
 
 # A standard transformer that embeds the input and evals layers and projects to final size
 class TransformerEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim, model_depth=1):
+    def __init__(self, input_dim, output_dim, model_depth=1, embedding_class=AngleEmbedding):
         super().__init__()
         embedding_depth = 8
         projection_dim = 8
@@ -149,12 +163,12 @@ class TransformerEncoder(nn.Module):
         self.input_dim = input_dim
 
         # fmt: off
-        self.embedding          = AngleEmbedding(input_dim, projection_dim=projection_dim, depth=embedding_depth)
+        self.embedding          = embedding_class(input_dim=input_dim, dim=projection_dim, depth=embedding_depth)
         self.transformer_blocks = nn.ModuleList([TransformerBlock(projection_dim, heads) for _ in range(model_depth)])
         self.final_projection   = nn.Linear(projection_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
 
-    def forward(self, x):
-        x = self.embedding(x)
+    def forward(self, x, embedding_args={}):
+        x = self.embedding(x, **embedding_args)
 
         for block in self.transformer_blocks:
             x = block(x)
@@ -191,7 +205,7 @@ def test_spherical_embedding():
 
 
 def test_angle_embedding():
-    model = AngleEmbedding(input_dim=1, projection_dim=8, depth=8)
+    model = AngleEmbedding(input_dim=1, dim=8, depth=8)
     x = torch.randn(10, 1)  # Bx1
     out = model(x)
 

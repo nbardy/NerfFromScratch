@@ -633,11 +633,59 @@ class MoeSpaceTimeModel(nn.Module):
         return torch.cat([color, opacity], dim=-1), features  # Return color and opacity, Bx4
 
 
+# A much simpler version of the model that just has a single geo_input MLP that use angleembeddings
+# Then we will use the split embeddings one as the gate and the other as the input to the next layer,
+# Then we only use one layer of SiGLU MLPs as an expert layer to product a 16x16 dim render feature
+# Then we use our 16x1 linear to get opacity
+# Then we use our 16+3+1x3 linear to get color
+class MoeSpaceTimeModelSimple(nn.Module):
+    def __init__(self):
+        super(MoeSpaceTimeModelSimple, self).__init__()
+        expert_feature_size = 8
+        total_experts = 128
+
+        self.expert_mlps = MoeLayer(
+            expert_class=lambda: MLP(input_dim=4, inner_dim=16, output_dim=expert_feature_size, depth=2),
+            gate=lambda: MLP(input_dim=4, inner_dim=4, output_dim=total_experts, depth=1),
+            moe_args=MoeArgs(
+                num_experts=total_experts,
+                num_selected_experts=4,
+                num_default_experts=4,
+            ),
+        )
+        self.feature_size = expert_feature_size * (4 + 4)
+        self.alpha_feature_layer = nn.Linear(self.feature_size, 1)
+        self.color_feature_layer = nn.Linear(self.feature_size + 3 + 1, 3)
+
+    def forward(self, point=None, origin=None, time=None):
+        pos, origin, t = point, origin, time
+        # non None
+        assert pos is not None, "pos is None"
+        assert origin is not None, "origin is None"
+        assert t is not None, "t is None"
+
+        x = torch.cat([pos, t], dim=1)
+        features = self.expert_mlps(x)
+
+        # Predict opacity, Bx1
+        opacity = self.alpha_feature_layer(features)
+        opacity = torch.relu(opacity)
+
+        # Predict color, Bx3
+        color_features = torch.cat([features, origin, opacity], dim=-1)
+        color = self.color_feature_layer(color_features)
+        color = torch.sigmoid(color)
+
+        return torch.cat([color, opacity], dim=-1), features  # Return color and opacity, Bx4
+
+
 def get_model(model_name, input_dim=6):
     if model_name == "mlp":
         return MLP(input_dim=input_dim, inner_dim=512, output_dim=3, depth=5)
     elif model_name == "mlp-gauss":
         return GaussianFeatureMLP(input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0)
+    elif model_name == "moe-spacetime-simple":
+        return MoeSpaceTimeModelSimple()
     elif model_name == "moe-spacetime":
         return MoeSpaceTimeModel()
     else:

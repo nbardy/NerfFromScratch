@@ -11,7 +11,7 @@ def debug_tensor(name, tensor):
 
 
 # histo tensor fn
-def histo_tensor(name, tensor):
+def histo_tensor(name, tensor, bins=None):
     print()
     print(f"== {name} ==")
     print("Tensor shape:", tensor.shape)  # Print the shape of the tensor
@@ -23,7 +23,9 @@ def histo_tensor(name, tensor):
 
     # Define the bins for the histogram based on the tensor type
     # Use default bins for histogram
-    bins = torch.linspace(-10, 10, steps=21)  # Default bins from -10 to 10 with 20 intervals
+    if bins is None:
+        bins = torch.linspace(-10, 10, steps=21)  # Default bins from -10 to 10 with 20 intervals
+
     # Compute the histogram
     hist = torch.histc(tensor.float(), bins=20, min=-10, max=10)
 
