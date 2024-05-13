@@ -207,8 +207,8 @@ def sample_n_points_from_tensors(
     for tensor in image_tensors:
         scale_y = viewport_size[0] / tensor.shape[0]
         scale_x = viewport_size[1] / tensor.shape[1]
-        rescaled_y = y_coords * scale_y
-        rescaled_x = x_coords * scale_x
+        rescaled_y = (y_coords * scale_y).int()  # Cast to int after scaling
+        rescaled_x = (x_coords * scale_x).int()  # Cast to int after scaling
         # Sample colors from tensor using the generated indices
         sampled_tensor_values = tensor[rescaled_y, rescaled_x, :]  # CxN
         # Move the batch to the last dim
@@ -666,7 +666,7 @@ def train_video(
 
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            features = get_feature_map_fake(video_path, frame, frame_index, args)
+            features = get_feature_map_fake(frame)
 
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates, sampled_features = sample_n_points_from_tensors(
                 [frame, camera_poses, camera_rays, frame_depth_estimate, features],

@@ -494,29 +494,34 @@ class MoeSpaceTimeModel(nn.Module):
         num_active_tables = num_geo_experts_chosen + num_table_experts_chosen
         scene_feature_size = num_active_tables * table_feature_size
 
-        self.feature_size = render_feature_size + geo_feature_size / 2
+        single_geo_feature_size = geo_feature_size // 2
+        self.feature_size = scene_feature_size + geo_feature_size // 2
 
         from transformers_model_code import SpaceTimeTransformerEncoder, TransformerEncoder
 
         # Output dim is 8 because we split it into 2x4 for two different 4 dim features
         geo_class = lambda: (
-            SpaceTimeTransformerEncoder(output_dim=geo_feature_size, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=8)
+            SpaceTimeTransformerEncoder(output_dim=geo_feature_size, model_depth=2) if use_attention_geo else SpacetimeGeometricMLP(output_dim=geo_feature_size)
         )
+
         print("---")
-        print(f"scene_feature_size = {scene_feature_size}")
+        print(f"geo_feature_size          = {geo_feature_size}")
+        print(f"single_geo_feature_size   = {single_geo_feature_size}")
+        print(f"scene_feature_size        = {scene_feature_size}")
+        print(f"feature_size              = {self.feature_size}")
         print("---")
-        self.feature_size
+
         render_class = lambda: (
             TransformerEncoder(model_depth=2, input_dim=self.feature_size, output_dim=render_feature_size)
             if use_attention_render
-            else SegGLUMLP(depth=2, input_dim=scene_feature_size, output_dim=render_feature_size)
+            else SegGLUMLP(depth=2, input_dim=self.feature_size, output_dim=render_feature_size)
         )
         table_class = lambda: LearnableLookupTable(input_dim=4, index_width=table_width, feature_size=table_feature_size)
 
         # geo_gate = lambda: SegGLUMLP(4, inner_dim=8, output_dim=num_geo_experts)
         geo_gate = lambda: SpacetimeGeometricMLP(hidden_dim=8, depth=2, output_dim=num_geo_experts_total, inner_activation=True, inner_bias=True)
-        table_gate = lambda: SegGLUMLP(geo_feature_size / 2, inner_dim=8, output_dim=num_total_tables)
-        feature_gate = lambda: nn.Linear(scene_feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
+        table_gate = lambda: SegGLUMLP(single_geo_feature_size, inner_dim=8, output_dim=num_total_tables)
+        render_gate = lambda: nn.Linear(self.feature_size, num_render_experts, bias=False)  # Since table size is large we want this to be single fast layer
 
         self.geometric_layer = MoeLayer(
             # experts=nn.ModuleList([geo_class() for _ in range(num_geo_experts_total)]),
@@ -546,7 +551,7 @@ class MoeSpaceTimeModel(nn.Module):
         print("Creating render layer")
         self.render_layer = MoeLayer(
             experts=nn.ModuleList([render_class() for _ in range(num_render_experts_total)]),
-            gate=feature_gate(),
+            gate=render_gate(),
             moe_args=MoeArgs(
                 num_experts=num_render_experts_total,
                 num_selected_experts=num_render_experts_chosen,
@@ -599,8 +604,10 @@ class MoeSpaceTimeModel(nn.Module):
         opacity = self.alpha_feature_layer(render_features)  # Predict opacity, Bx1
         opacity = torch.relu(opacity)
 
-        color_input = torch.cat([render_features, origin, opacity], dim=-1)  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
-        color = self.color_feature_layer(color_input)  # Predict color, Bx3
+        color_features = torch.cat(
+            [render_features, origin, opacity], dim=-1
+        )  # Concatenate render features, direction, and opacity, Bx(render_feature_size+3+1)
+        color = self.color_feature_layer(color_features)  # Predict color, Bx3
         color = torch.sigmoid(color)
 
         return torch.cat([color, opacity], dim=-1), features  # Return color and opacity, Bx4
