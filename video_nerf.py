@@ -707,6 +707,7 @@ def train_video(
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
             camera_rays = rearrange(camera_rays, "c w h -> w h c")
 
+            raise Exception("Not implemented: TODO! Add depth map support, first support multi resolution")
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
             features = get_feature_map_fake(frame)
