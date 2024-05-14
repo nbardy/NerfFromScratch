@@ -4,6 +4,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import hashlib
 
 import kornia as K
 import requests
@@ -46,8 +47,6 @@ def assert_video_shape(video_frames: torch.Tensor):
     assert video_frames.shape[2] > 280, f"Expect width to be greater than 280. Got {video_frames.shape[2]}\n Full shape: {video_frames.shape}"
     assert video_frames.shape[0] > 20, f"Expect frames to be greater than 20. Got {video_frames.shape[0]}\n Full shape: {video_frames.shape}"
 
-    print("vfs", video_frames.shape)
-
     for frame in video_frames:
         assert_is_video_frame(frame)
 
@@ -71,9 +70,6 @@ def compute_blur_score_single_frame(frame: torch.Tensor) -> float:
 
 
 def generate_hash_and_cache_path(video_frames: torch.Tensor, key: str) -> Path:
-    import hashlib
-
-    print("video frames type", type(video_frames))
 
     hasher = hashlib.sha256()
     for frame in video_frames:

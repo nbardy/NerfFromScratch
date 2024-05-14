@@ -642,12 +642,21 @@ class MoeSpaceTimeModel(nn.Module):
 class MoeSpaceTimeModelSimple(nn.Module):
     def __init__(self):
         super(MoeSpaceTimeModelSimple, self).__init__()
-        expert_feature_size = 32
+        expert_feature_size = 16 * 16
         total_experts = 128
 
+        from transformers_model_code import AngleEmbedding
+
+        self.embedding = nn.Sequential(AngleEmbedding(input_dim=4, depth=16, dim=16), nn.Flatten())
+
         self.expert_mlps = MoeLayer(
-            expert_class=lambda: MLP(input_dim=4, inner_dim=16, output_dim=expert_feature_size, depth=2),
-            gate=MLP(input_dim=4, inner_dim=4, output_dim=total_experts, depth=1),
+            expert_class=lambda: MLP(
+                input_dim=expert_feature_size,
+                inner_dim=expert_feature_size,
+                output_dim=expert_feature_size,
+                depth=2,
+            ),
+            gate=MLP(input_dim=expert_feature_size, inner_dim=4, output_dim=total_experts, depth=1),
             moe_args=MoeArgs(
                 num_experts=total_experts,
                 num_selected_experts=4,
@@ -667,6 +676,7 @@ class MoeSpaceTimeModelSimple(nn.Module):
 
         x = torch.cat([pos, t], dim=1)
 
+        x = self.embedding(x)
         features = self.expert_mlps(x)
 
         # Predict opacity, Bx1

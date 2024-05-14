@@ -102,6 +102,30 @@ class LearnableCameraPosition(nn.Module):
             self.up_vectors[frame_idx],
         )
 
+    def get_wandb_scene(self):
+        from math import clamp
+
+        vectors = []
+        color_0 = [224, 184, 0]
+        color_1 = [0, 224, 184]
+
+        for i in range(self.positions.shape[0]):
+            position, direction, up_vector = self.get(i)
+            color = color_0 if i % 2 == 0 else color_1
+            # Forward direction vector (red to green, 4x length)
+            forward_vector = {"start": position.tolist(), "end": (position + 4 * direction).tolist(), "color": color}  # Red color to indicate camera direction
+
+            up_color = [clamp(color[0] + 20, 0, 255), clamp(color[1] + 20, 0, 255), clamp(color[2] + 20, 0, 255)]
+            up_vector = {"start": position.tolist(), "end": (position + up_vector).tolist(), "color": up_color}  # Green color to indicate up direction
+
+            vectors.append(forward_vector)
+            vectors.append(up_vector)
+
+        scene = wandb.Object3D(
+            {"type": "lidar/beta", "vectors": np.array(vectors), "points": np.array([]), "boxes": np.array([])}  # No boxes needed for this visualization
+        )
+        return scene
+
     def get_rays(self, frame_idx, size=None):
         if size is None:
             raise ValueError("Size must be provided")
@@ -262,11 +286,8 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
 
     ray_directions = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1)
 
-    print("ray_origins", ray_origins.shape)
     ray_origins = repeat(ray_origins, "b c -> b nb_bins c", nb_bins=nb_bins)  # Bxnb_binsx3
-    print("pre times", times.shape)
     times = repeat(times, "b 1 -> b nb_bins", nb_bins=nb_bins)  # Bxnb_bins
-    print("post times", times.shape)
 
     # Use einops.rearrange for reshaping operations
     flat_x = rearrange(x, "b nb_bins c -> (b nb_bins) c")  # B*nb_binsx3
@@ -517,11 +538,6 @@ def sample_with_scores_and_runs(
     if cluster_indices.numel() > n_cluster:
         cluster_indices = cluster_indices[torch.randperm(cluster_indices.numel())[:n_cluster]]
 
-    print("uniform_indices device", uniform_indices.device)
-    print("diff_indices device", diff_indices.device)
-    print("blur_indices device", blur_indices.device)
-    print("cluster_indices device", cluster_indices.device)
-
     all_indices = torch.cat((uniform_indices, diff_indices, blur_indices, cluster_indices))
     unique_indices = torch.unique(all_indices)
 
@@ -552,8 +568,6 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
     sampled_frames = []
     indices = []
     if not args.weight_blur_and_difference:
-        print("== sampling ==")
-        print("Sampling with uniform")
         sampled_frames, sampled_indices = sample_uniform_with_runs(
             video_frames,
             n_frames,
@@ -561,8 +575,6 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
         )
         indices += sampled_indices
     else:
-        print("== sampling ==")
-        print("Sampling with weighted")
         assert blur_scores is not None, "Blur scores are required for weighted sampling."
         assert differences is not None, "Differences are required for weighted sampling."
 
@@ -576,8 +588,6 @@ def sample_video_frames_by_args(video_frames, n_frames=None, blur_scores=None, d
         indices += sampled_indices
 
     if args.sample_long_temporal:
-        print("== sampling ==")
-        print("Sampling with long temporal")
         long_temporal_indices = sample_exponential_clusters(len(video_frames), 11, 8, 5, 10)
         long_temporal_frames = [video_frames[i] for i in long_temporal_indices.tolist()]
         sampled_frames += long_temporal_frames
@@ -623,9 +633,7 @@ def train_video(
         list(scene_function.parameters()) + list(camera_position.parameters()),
         lr=args.lr,
         # low Eps, high betas and small weight decay to train the lookup tables according to instant ngp
-        betas=(0.99, 0.9999),
-        eps=1e-9,
-        weight_decay=args.weight_decay,
+        # weight_decay=args.weight_decay,
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -771,6 +779,9 @@ def train_video(
                 }
             )
 
+            # scene = camera_position.get_wandb_scene(camera_position)
+            # log_data.update({"camera_orientation": scene})
+
             if torch.isnan(base_loss):
                 print("Warning: NaN detected in base_loss")
 
@@ -801,10 +812,12 @@ def train_video(
 
         total_loss /= gradient_accumulation_steps
         if (epoch + 1) % gradient_accumulation_steps == 0:
-            optimizer.zero_grad()
+            #
+            print("backward")
             accelerator.backward(total_loss)
             optimizer.step()
             scheduler.step()
+            optimizer.zero_grad()
 
         # Log a small thumbnail always 1/4 size
         if args.should_log_validation_image:
@@ -904,14 +917,29 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     log_data = {}
     total_points = size[0] * size[1]
     # First  frames
-    t_val = 0
-    t = torch.ones(total_points, 1) * (t_val / total_frames)
+    frame_idx = 0
+    t = torch.ones(total_points, 1) * (frame_idx / total_frames)
     t = t.to(device)
 
-    camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=t_val)
-    image_tensor = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)  # BxCxHxW
-    image_pil = Image.fromarray((image_tensor.cpu().numpy() * 255).astype(np.uint8), "RGB")
-    gt_frame = video_frames[t_val]
+    camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_idx)
+    generated_image, sigma = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)  # BxCxHxW
+
+    print("genreated_image shape", generated_image.shape)
+    print("sigma shape", sigma.shape)
+
+    # Scale colors back to [0, 255] and reshape to image dimensions
+    scaled_generated = generated_image.detach().cpu().numpy() * 255
+    scaled_generated = np.clip(scaled_generated, 0, 255).astype(np.uint8)  # Use np.clip for numpy arrays
+    image_pil = Image.fromarray(scaled_generated, "RGB")
+
+    gt_frame = video_frames[frame_idx]
+    gt_scaled = gt_frame.cpu().numpy() * 255
+    gt_scaled = np.clip(gt_scaled, 0, 255).astype(np.uint8)  # Use np.clip for numpy arrays
+    gt_frame_pil = Image.fromarray(gt_scaled, "RGB")
+
+    sigma = sigma.detach().cpu().numpy()
+    sigma = np.clip(sigma, 0, 255).astype(np.uint8)  # Use np.clip for numpy arrays
+    depth_pil = Image.fromarray(sigma, "L")
 
     if not prefix:
         prefix = ""
@@ -919,10 +947,12 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
         prefix = prefix + "/"
 
     log_data[f"{prefix}predicted"] = wandb.Image(image_pil)
-    log_data[f"{prefix}predicted_histo"] = image_tensor
-    gt_frame_pil = Image.fromarray((gt_frame.cpu().numpy() * 255).astype(np.uint8), "RGB")
+    log_data[f"{prefix}predicted_histo"] = generated_image
     log_data[f"{prefix}ground truth"] = wandb.Image(gt_frame_pil)
     log_data[f"{prefix}ground_truth_histo"] = gt_frame
+    log_data[f"{prefix}depth"] = wandb.Image(depth_pil)
+    log_data[f"{prefix}depth_histo"] = sigma
+
     return log_data
 
 
@@ -971,15 +1001,16 @@ def inference_nerf(
         batch_rays = camera_rays_flat[start_idx:end_idx, :]
         batch_times = t[start_idx:end_idx, :]
         rgba, features = model(point=batch_positions, time=batch_times, origin=batch_rays)
-        colors = rgba[:, :3]
+        colors, sigma = rgba[:, :3], rgba[:, 3]
         generated_colors[start_idx:end_idx, :] = colors
 
-    # Scale colors back to [0, 255] and reshape to image dimensions
-    scaled_colors = ((generated_colors + 1) * 0.5) * 255  # [(W*H), 3]
-    scaled_colors = scaled_colors.clamp(0, 255).byte()
-    scaled_colors = rearrange(scaled_colors, "(w h) c -> h w c", w=image_size[0], h=image_size[1])  # [H, W, 3]
+    # Reshape generated_colors to image dimensions
+    generated_colors = rearrange(generated_colors, "(w h) c -> w h c", w=image_size[1], h=image_size[0])  # [H, W, 3]
 
-    return scaled_colors
+    # Ensure sigma is reshaped correctly by using the correct width and height
+    sigma = rearrange(sigma, "(w h) -> w h", w=image_size[1], h=image_size[0])  # [H, W]
+
+    return generated_colors, sigma
 
 
 import argparse
@@ -989,13 +1020,13 @@ parser.add_argument("--epochs", type=int, default=200, help="Number of epochs to
 parser.add_argument(
     "--n_points",
     type=int,
-    default=400,
+    default=40,
     help="Number of points to sample for training",
 )
 parser.add_argument(
     "--n_frames",
     type=int,
-    default=60,
+    default=8,
     help="Number of frames to sample from the video",
 )
 parser.add_argument("--validation_steps", type=int, default=10)
@@ -1074,7 +1105,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale_entropy_loss",
     type=float,
-    default=0.02,
+    default=0.001,
     help="Scaling factor for entropy loss.",
 )
 parser.add_argument(
@@ -1099,7 +1130,7 @@ parser.add_argument(
 parser.add_argument(
     "--lr",
     type=float,
-    default=0.001,
+    default=0.0001,
     help="Learning rate for the optimizer.",
 )
 parser.add_argument(
@@ -1125,7 +1156,7 @@ parser.add_argument(
 parser.add_argument(
     "--gradient_accumulation_steps",
     type=int,
-    default=64,
+    default=1,
     help="Number of gradient accumulation steps.",
 )
 
