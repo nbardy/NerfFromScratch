@@ -661,8 +661,10 @@ def train_video(
     assert gradient_accumulation_steps > 0, "Gradient accumulation steps must be greater than 0."
 
     i = 0
-    for epoch in range(epochs):
-        print("Epoch: ", i)
+    from tqdm import tqdm
+
+    for epoch in tqdm(range(epochs)):
+        # print("Epoch: ", i)
         i += 1
 
         sampled_frames, sampled_indices = sample_video_frames_by_args(
@@ -707,11 +709,6 @@ def train_video(
 
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
-            print(" . * ====== * .")
-            print("frame depth shape", frame_depth_estimate.shape)
-            print("frame shape", frame.shape)
-            print(" . * ====== * .")
-
             features = get_feature_map_fake(frame)
 
             values, indices = sample_n_points_from_tensors(
@@ -722,15 +719,6 @@ def train_video(
             )
             sampled_colors, sampled_poses, sampled_rays, sampled_depth_estimates, sampled_features = values
             # Convert list of tuples to a list of tensors
-
-            # flatten
-            wandb.log(
-                {
-                    f"debug_frame/flatten_frame_{frame_index}": flatten_frame,
-                    f"debug_frame/frame_image_{frame_index}": wandb.Image(pil_frame),
-                },
-                commit=False,
-            )
 
             batch_camera_poses.append(sampled_poses)
             batch_rays.append(sampled_rays)
@@ -793,7 +781,6 @@ def train_video(
             if not torch.isfinite(base_loss):
                 print("Warning Inf base loss")
 
-            print("Batch Loss: ", base_loss.item())
             log_data[f"{args.loss_type}_loss"] = base_loss.item()
             total_loss += base_loss
 
@@ -818,21 +805,16 @@ def train_video(
         total_loss /= gradient_accumulation_steps
         accelerator.backward(total_loss)
         if (epoch + 1) % gradient_accumulation_steps == 0:
-            #
-            print("backward")
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
-        # Log a small thumbnail always 1/4 size
+        # Log a small thumbnail always 1/64 size
         if args.should_log_validation_image:
-            print("Logging image...")
             log_data.update(log_image(scene_function, video_frames, camera_position, small_image_size, frame_count, prefix="small_image"))
 
         if epoch != 0 and epoch % args.validation_steps == 0 and args.should_log_validation_image:
-            print("Logging image...")
             log_data.update(log_image(scene_function, video_frames, camera_position, size, frame_count))
-            print("done logging image")
 
         log_data["total_loss"] = total_loss.item()
         log_data["learning_rate"] = scheduler.get_last_lr()[0]
@@ -931,14 +913,13 @@ def train_video(
 #         wandb.log(log_data)
 
 
-def log_image(scene_function, video_frames, camera_position, size, total_frames, device=None, prefix=None):
-    if device is None:
-        device = get_default_device()
+def log_image(scene_function, video_frames, camera_position, size, total_frames, prefix=None):
+    device = video_frames[0].device
     log_data = {}
     total_points = size[0] * size[1]
     # First  frames
     frame_idx = 0
-    t = torch.ones(total_points, 1) * (frame_idx / total_frames)
+    t = torch.ones(total_points, 1, device=device) * (frame_idx / total_frames)
     t = t.to(device)
 
     camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_idx)
@@ -952,7 +933,7 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     gt_scaled = (gt_frame * 255).clamp(0, 255).to(torch.uint8)  # Perform scaling and clamping on GPU
     gt_frame_pil = Image.fromarray(gt_scaled.cpu().numpy(), "RGB")  # Convert to CPU for PIL handling
 
-    depth_scaled = depth / torch.max(depth)  # norm depth to 0-1
+    depth_scaled = depth / (torch.max(depth) + 1e-10)  # Normalize depth to 0-1 with epsilon for safety
     depth_image = depth_scaled.detach().clamp(0, 255).to(torch.uint8).squeeze()  # Perform clamping on GPU and ensure sigma is 2D
     depth_pil = Image.fromarray(depth_image.cpu().numpy(), "L")  # Convert to CPU for PIL handling
 
@@ -1041,17 +1022,17 @@ def inference_nerf(
 import argparse
 
 parser = argparse.ArgumentParser(description="Train a NeRF model on a single image.")
-parser.add_argument("--epochs", type=int, default=20000, help="Number of epochs to train.")
+parser.add_argument("--epochs", type=int, default=800000, help="Number of epochs to train.")
 parser.add_argument(
     "--n_points",
     type=int,
-    default=200,
+    default=100,
     help="Number of points to sample for training",
 )
 parser.add_argument(
     "--n_frames",
     type=int,
-    default=4,
+    default=5,
     help="Number of frames to sample from the video",
 )
 parser.add_argument("--validation_steps", type=int, default=10)
@@ -1136,7 +1117,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale_entropy_loss",
     type=float,
-    default=0.01,
+    default=0.0005,
     help="Scaling factor for entropy loss.",
 )
 parser.add_argument(
@@ -1161,7 +1142,7 @@ parser.add_argument(
 parser.add_argument(
     "--lr",
     type=float,
-    default=0.01,
+    default=0.001,
     help="Learning rate for the optimizer.",
 )
 parser.add_argument(
