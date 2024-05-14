@@ -642,12 +642,20 @@ class MoeSpaceTimeModel(nn.Module):
 class MoeSpaceTimeModelSimple(nn.Module):
     def __init__(self):
         super(MoeSpaceTimeModelSimple, self).__init__()
-        expert_feature_size = 16 * 16
-        total_experts = 128
+        expert_feature_size = 64
+        total_experts = 16
 
-        from transformers_model_code import AngleEmbedding
+        # from transformers_model_code import AngleEmbedding
 
-        self.embedding = nn.Sequential(AngleEmbedding(input_dim=4, depth=16, dim=16), nn.Flatten())
+        # self.embedding = nn.Sequential(AngleEmbedding(input_dim=4, depth=16, dim=16), nn.Flatten())
+        # Embedding should go from 4 dims to 16x16 dims
+        # For this lets do linear without bias after doing  silu(sin(x), sin(x), cos(x), silu(cos(x))
+        from einops import rearrange, repeat
+
+        self.e1 = lambda x: torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # Bx8
+        self.e2 = lambda x: torch.cat([x, torch.nn.functional.silu(x)], dim=-1)  # Bx16
+        self.e3 = nn.Linear(4 * 2 * 2, expert_feature_size, bias=False)  # Bxexpert_feature_size
+        self.embedding = lambda x: self.e3(self.e2(self.e1(x)))
 
         self.expert_mlps = MoeLayer(
             expert_class=lambda: MLP(
@@ -659,8 +667,8 @@ class MoeSpaceTimeModelSimple(nn.Module):
             gate=MLP(input_dim=expert_feature_size, inner_dim=4, output_dim=total_experts, depth=1),
             moe_args=MoeArgs(
                 num_experts=total_experts,
-                num_selected_experts=4,
-                num_default_experts=4,
+                num_selected_experts=2,
+                num_default_experts=2,
             ),
         )
         self.feature_size = expert_feature_size
@@ -691,6 +699,33 @@ class MoeSpaceTimeModelSimple(nn.Module):
         return torch.cat([color, opacity], dim=-1), features  # Return color and opacity, Bx4
 
 
+class SpaceTimeMLPSimple(nn.Module):
+    def __init__(self):
+        super(SpaceTimeMLPSimple, self).__init__()
+        self.alpha_mlp = MLP(input_dim=4, inner_dim=16, output_dim=1, depth=2)
+        self.color_mlp = MLP(input_dim=4 + 1 + 3, inner_dim=16, output_dim=3, depth=2)
+        self.feature_size = 4
+
+    def forward(self, point=None, origin=None, time=None):
+        pos, origin, t = point, origin, time
+        # non None
+        assert pos is not None, "pos is None"
+        assert origin is not None, "origin is None"
+        assert t is not None, "t is None"
+
+        x = torch.cat([pos, t], dim=1)
+        alpha = self.alpha_mlp(x)
+        alpha = torch.relu(alpha)
+
+        x_color = torch.cat([x, alpha, origin], dim=-1)
+        color = self.color_mlp(x_color)
+        color = torch.sigmoid(color)
+
+        result = torch.cat([color, alpha], dim=-1)
+        feature = torch.cat([x, alpha], dim=-1)
+        return result, feature
+
+
 def get_model(model_name, input_dim=6):
     if model_name == "mlp":
         return MLP(input_dim=input_dim, inner_dim=512, output_dim=3, depth=5)
@@ -698,6 +733,8 @@ def get_model(model_name, input_dim=6):
         return GaussianFeatureMLP(input_dim=input_dim, output_dim=3, num_features=256, sigma=10.0)
     elif model_name == "moe-spacetime-simple":
         return MoeSpaceTimeModelSimple()
+    elif model_name == "spacetime-mlp":
+        return SpaceTimeMLPSimple()
     elif model_name == "moe-spacetime":
         return MoeSpaceTimeModel()
     else:

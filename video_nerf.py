@@ -707,6 +707,11 @@ def train_video(
 
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
+            print(" . * ====== * .")
+            print("frame depth shape", frame_depth_estimate.shape)
+            print("frame shape", frame.shape)
+            print(" . * ====== * .")
+
             features = get_feature_map_fake(frame)
 
             values, indices = sample_n_points_from_tensors(
@@ -811,10 +816,10 @@ def train_video(
             log_data["feature_mapping_loss"] = feature_mapping_loss
 
         total_loss /= gradient_accumulation_steps
+        accelerator.backward(total_loss)
         if (epoch + 1) % gradient_accumulation_steps == 0:
             #
             print("backward")
-            accelerator.backward(total_loss)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -831,84 +836,99 @@ def train_video(
 
         log_data["total_loss"] = total_loss.item()
         log_data["learning_rate"] = scheduler.get_last_lr()[0]
+
+        def check_nan_or_inf(maybe_tensor):
+            if type(maybe_tensor) == torch.Tensor:
+                tensor = maybe_tensor
+            else:
+                return
+
+            if torch.isnan(tensor).any():
+                raise ValueError(f"Tensor contains NaN values. {key}")
+            if torch.isinf(tensor).any():
+                raise ValueError(f"Tensor contains Inf values. {key}")
+
+        for key, value in log_data.items():
+            check_nan_or_inf(value)
+
         wandb.log(log_data)
 
 
-def train_style_video(
-    video_path,
-    epochs=5,
-    blur_scores=None,
-    differences=None,
-    args=None,
-):
-    assert args.clip_style_image or args.clip_style_text or args.geo_style_image or args.geo_style_text, "Style training requires CLIP style image or text."
+# def train_style_video(
+#     video_path,
+#     epochs=5,
+#     blur_scores=None,
+#     differences=None,
+#     args=None,
+# ):
+#     assert args.clip_style_image or args.clip_style_text or args.geo_style_image or args.geo_style_text, "Style training requires CLIP style image or text."
 
-    wandb.init(project="3D_nerf")
+#     wandb.init(project="3D_nerf")
 
-    camera_position = LearnableCameraPosition(n_frames=1)  # Single frame for style training
-    scene_function = get_model(args.model)
+#     camera_position = LearnableCameraPosition(n_frames=1)  # Single frame for style training
+#     scene_function = get_model(args.model)
 
-    # Configure LoRA
-    lora_config = LoraConfig(
-        lora_alpha=16,
-        lora_dropout=0.1,
-        r=args.lora_rank,
-        bias="none",
-        target_modules=["linear"],
-    )
-    scene_function_with_lora = inject_adapter_in_model(lora_config, scene_function)
+#     # Configure LoRA
+#     lora_config = LoraConfig(
+#         lora_alpha=16,
+#         lora_dropout=0.1,
+#         r=args.lora_rank,
+#         bias="none",
+#         target_modules=["linear"],
+#     )
+#     scene_function_with_lora = inject_adapter_in_model(lora_config, scene_function)
 
-    # Filter parameters to only include those from LoRA layers for optimization
-    lora_params = [p for n, p in scene_function_with_lora.named_parameters() if "lora" in n]
+#     # Filter parameters to only include those from LoRA layers for optimization
+#     lora_params = [p for n, p in scene_function_with_lora.named_parameters() if "lora" in n]
 
-    optimizer = torch.optim.Adam(
-        lora_params,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+#     optimizer = torch.optim.Adam(
+#         lora_params,
+#         lr=args.lr,
+#         weight_decay=args.weight_decay,
+#     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    device = get_default_device()
-    video_frames, _ = load_video(video_path, max_frames=1)  # Only load a single frame for style training
-    size = [384, 384]  # Fixed resolution for CLIP model
+#     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+#     device = get_default_device()
+#     video_frames, _ = load_video(video_path, max_frames=1)  # Only load a single frame for style training
+#     size = [384, 384]  # Fixed resolution for CLIP model
 
-    scene_function_with_lora.to(device)
-    camera_position.to(device)
+#     scene_function_with_lora.to(device)
+#     camera_position.to(device)
 
-    for epoch in range(epochs):
-        frame_index = 0  # Always use the first frame for style training
-        frame = video_frames[frame_index].to(device)
-        frame = torch.nn.functional.interpolate(frame.unsqueeze(0), size=size, mode="bilinear", align_corners=False).squeeze(0)
+#     for epoch in range(epochs):
+#         frame_index = 0  # Always use the first frame for style training
+#         frame = video_frames[frame_index].to(device)
+#         frame = torch.nn.functional.interpolate(frame.unsqueeze(0), size=size, mode="bilinear", align_corners=False).squeeze(0)
 
-        camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
-        generated_colors, _, depth = render_rays(
-            scene_function_with_lora,
-            camera_poses,
-            camera_rays,
-            torch.zeros(1, 1).to(device),  # Dummy batch_t for compatibility
-            near,
-            far,
-            num_samples_ray_samples,
-            args=args,
-        )
+#         camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_index)
+#         generated_colors, _, depth = render_rays(
+#             scene_function_with_lora,
+#             camera_poses,
+#             camera_rays,
+#             torch.zeros(1, 1).to(device),  # Dummy batch_t for compatibility
+#             near,
+#             far,
+#             num_samples_ray_samples,
+#             args=args,
+#         )
 
-        style_loss = compute_style_loss(generated_colors, depth, args)
+#         style_loss = compute_style_loss(generated_colors, depth, args)
 
-        optimizer.zero_grad()
-        style_loss.backward()
-        optimizer.step()
-        scheduler.step()
+#         optimizer.zero_grad()
+#         style_loss.backward()
+#         optimizer.step()
+#         scheduler.step()
 
-        # log generated colors and depth
-        histo_tensor("generated_colors", generated_colors)
+#         # log generated colors and depth
+#         histo_tensor("generated_colors", generated_colors)
 
-        log_data = {
-            "generated_colors": wandb.Image(generated_colors),
-            "depth": wandb.Image(depth),
-            "style loss": style_loss.item(),
-            "learning rate": scheduler.get_last_lr()[0],
-        }
-        wandb.log(log_data)
+#         log_data = {
+#             "generated_colors": wandb.Image(generated_colors),
+#             "depth": wandb.Image(depth),
+#             "style loss": style_loss.item(),
+#             "learning rate": scheduler.get_last_lr()[0],
+#         }
+#         wandb.log(log_data)
 
 
 def log_image(scene_function, video_frames, camera_position, size, total_frames, device=None, prefix=None):
@@ -922,24 +942,22 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     t = t.to(device)
 
     camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=frame_idx)
-    generated_image, sigma = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)  # BxCxHxW
-
-    print("genreated_image shape", generated_image.shape)
-    print("sigma shape", sigma.shape)
+    generated_image, depth, disp = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t, args=args)  # BxCxHxW
 
     # Scale colors back to [0, 255] and reshape to image dimensions
-    scaled_generated = generated_image.detach().cpu().numpy() * 255
-    scaled_generated = np.clip(scaled_generated, 0, 255).astype(np.uint8)  # Use np.clip for numpy arrays
-    image_pil = Image.fromarray(scaled_generated, "RGB")
+    scaled_generated = (generated_image.detach() * 255).clamp(0, 255).to(torch.uint8)  # Perform scaling and clamping on GPU
+    image_pil = Image.fromarray(scaled_generated.cpu().numpy(), "RGB")  # Convert to CPU for PIL handling
 
     gt_frame = video_frames[frame_idx]
-    gt_scaled = gt_frame.cpu().numpy() * 255
-    gt_scaled = np.clip(gt_scaled, 0, 255).astype(np.uint8)  # Use np.clip for numpy arrays
-    gt_frame_pil = Image.fromarray(gt_scaled, "RGB")
+    gt_scaled = (gt_frame * 255).clamp(0, 255).to(torch.uint8)  # Perform scaling and clamping on GPU
+    gt_frame_pil = Image.fromarray(gt_scaled.cpu().numpy(), "RGB")  # Convert to CPU for PIL handling
 
-    sigma = sigma.detach().cpu().numpy()
-    sigma = np.clip(sigma, 0, 255).astype(np.uint8)  # Use np.clip for numpy arrays
-    depth_pil = Image.fromarray(sigma, "L")
+    depth_scaled = depth / torch.max(depth)  # norm depth to 0-1
+    depth_image = depth_scaled.detach().clamp(0, 255).to(torch.uint8).squeeze()  # Perform clamping on GPU and ensure sigma is 2D
+    depth_pil = Image.fromarray(depth_image.cpu().numpy(), "L")  # Convert to CPU for PIL handling
+
+    disp = disp.detach().clamp(0, 255).to(torch.uint8).squeeze()  # Perform clamping on GPU and ensure sigma is 2D
+    disp_pil = Image.fromarray(disp.cpu().numpy(), "L")  # Convert to CPU for PIL handling
 
     if not prefix:
         prefix = ""
@@ -949,9 +967,11 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     log_data[f"{prefix}predicted"] = wandb.Image(image_pil)
     log_data[f"{prefix}predicted_histo"] = generated_image
     log_data[f"{prefix}ground truth"] = wandb.Image(gt_frame_pil)
-    log_data[f"{prefix}ground_truth_histo"] = gt_frame
     log_data[f"{prefix}depth"] = wandb.Image(depth_pil)
-    log_data[f"{prefix}depth_histo"] = sigma
+    log_data[f"{prefix}depth_histo"] = depth_image
+    log_data[f"{prefix}depth_scaled"] = depth_scaled
+    log_data[f"{prefix}disp"] = wandb.Image(disp_pil)
+    log_data[f"{prefix}disp_histo"] = disp
 
     return log_data
 
@@ -965,7 +985,7 @@ def log_video(scene_function, video_frames, camera_position, size, max_frames, d
         t = t.to(device)
 
         camera_poses, camera_rays = camera_position.get_rays(size=size, frame_idx=int(0.5 * len(video_frames)) + i)
-        image = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t)
+        image, depth, disp = inference_nerf(scene_function, camera_poses, camera_rays, size, t=t, args=args)
         frames.append(np.array(image))
 
     log_data["video"] = wandb.Video(np.stack(frames, axis=0), fps=4, format="mp4")
@@ -973,23 +993,25 @@ def log_video(scene_function, video_frames, camera_position, size, max_frames, d
 
 
 def inference_nerf(
-    model,
+    nerf_model,
     camera_positions,
     camera_rays,
     image_size,
     max_inference_batch_size=1280,
     t=None,
+    args=None,
 ):
-
-    # Assert t
     assert t is not None
+    assert args is not None
 
     # Flatten camera positions and rays for model input using einops rearrange
     camera_positions_flat = rearrange(camera_positions, "c w h -> (w h) c")  # [W*H, 3]
     camera_rays_flat = rearrange(camera_rays, "c w h -> (w h) c")  # [W*H, 3]
 
-    # Initialize tensor to store generated colors
+    # Initialize tensor to store generated colors and sigma
     generated_colors = torch.empty((camera_positions_flat.shape[0], 3), device=camera_positions_flat.device)  # [W*H, 3]
+    generated_depth = torch.empty((camera_positions_flat.shape[0], 1), device=camera_positions_flat.device)  # [W*H, 1]
+    generated_disp = torch.empty((camera_positions_flat.shape[0], 1), device=camera_positions_flat.device)  # [W*H, 1]
 
     # Process in batches to avoid memory overflow
     num_batches = (camera_positions_flat.shape[0] + max_inference_batch_size - 1) // max_inference_batch_size
@@ -1000,40 +1022,49 @@ def inference_nerf(
         batch_positions = camera_positions_flat[start_idx:end_idx, :]
         batch_rays = camera_rays_flat[start_idx:end_idx, :]
         batch_times = t[start_idx:end_idx, :]
-        rgba, features = model(point=batch_positions, time=batch_times, origin=batch_rays)
-        colors, sigma = rgba[:, :3], rgba[:, 3]
+
+        # Call render_rays instead of the model directly
+        colors, _, depth, disp, features = render_rays(nerf_model, batch_positions, batch_rays, batch_times, args=args)
+
         generated_colors[start_idx:end_idx, :] = colors
+        generated_depth[start_idx:end_idx, :] = depth.unsqueeze(-1)  # Use depth as sigma for visualization
+        generated_disp[start_idx:end_idx, :] = disp.unsqueeze(-1)  # Use depth as sigma for visualization
 
     # Reshape generated_colors to image dimensions
-    generated_colors = rearrange(generated_colors, "(w h) c -> w h c", w=image_size[1], h=image_size[0])  # [H, W, 3]
+    generated_colors = rearrange(generated_colors, "(w h) c -> w h c", w=image_size[0], h=image_size[1])  # [H, W, 3]
+    generated_depth = rearrange(generated_depth, "(w h) 1 -> w h 1", w=image_size[0], h=image_size[1])  # [H, W, 1]
+    generated_disp = rearrange(generated_disp, "(w h) 1 -> w h 1", w=image_size[0], h=image_size[1])  # [H, W, 1]
 
-    # Ensure sigma is reshaped correctly by using the correct width and height
-    sigma = rearrange(sigma, "(w h) -> w h", w=image_size[1], h=image_size[0])  # [H, W]
-
-    return generated_colors, sigma
+    return generated_colors, generated_depth, generated_disp
 
 
 import argparse
 
 parser = argparse.ArgumentParser(description="Train a NeRF model on a single image.")
-parser.add_argument("--epochs", type=int, default=200, help="Number of epochs to train.")
+parser.add_argument("--epochs", type=int, default=20000, help="Number of epochs to train.")
 parser.add_argument(
     "--n_points",
     type=int,
-    default=40,
+    default=200,
     help="Number of points to sample for training",
 )
 parser.add_argument(
     "--n_frames",
     type=int,
-    default=8,
+    default=4,
     help="Number of frames to sample from the video",
 )
 parser.add_argument("--validation_steps", type=int, default=10)
 # bool
 parser.add_argument("--should_log_validation_image", action="store_true", default=True)
 parser.add_argument("--video_validation_steps", type=int, default=50)
-parser.add_argument("--model", type=str, default="moe-spacetime-simple", help="Model to use")
+parser.add_argument(
+    "--model",
+    type=str,
+    default="spacetime-mlp",
+    choices=["moe-spacetime-simple", "spacetime-mlp"],
+    help="Model to use",
+)
 parser.add_argument(
     "--max_frames",
     type=int,
@@ -1068,7 +1099,7 @@ parser.add_argument("---add_feature_mapping", action="store_true", default=False
 parser.add_argument(
     "--entropy_threshold",
     type=float,
-    default=0.2,
+    default=0.05,
     help="Entropy threshold for entropy loss.",
 )
 parser.add_argument(
@@ -1105,7 +1136,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale_entropy_loss",
     type=float,
-    default=0.001,
+    default=0.01,
     help="Scaling factor for entropy loss.",
 )
 parser.add_argument(
@@ -1130,7 +1161,7 @@ parser.add_argument(
 parser.add_argument(
     "--lr",
     type=float,
-    default=0.0001,
+    default=0.01,
     help="Learning rate for the optimizer.",
 )
 parser.add_argument(
@@ -1156,7 +1187,7 @@ parser.add_argument(
 parser.add_argument(
     "--gradient_accumulation_steps",
     type=int,
-    default=1,
+    default=4,
     help="Number of gradient accumulation steps.",
 )
 
@@ -1181,6 +1212,8 @@ if __name__ == "__main__":
     if args.weight_blur_and_difference:
         blur_scores = blur_scores(video_frames)
         blur_scores = blur_scores.to(device)
+        # fp16
+        blur_scores = blur_scores.half()
 
         differences = get_image_feature_difference_scores(video_frames)
         # else none

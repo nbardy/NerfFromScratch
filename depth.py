@@ -56,19 +56,113 @@ def image_depth(image_tensor, cache_dir="cache"):
         print("Loading depth tensor from cache.")
         predicted_depth = torch.load(cache_path)
     else:
-        inputs = model_cache["processor"](images=image_tensor.to(device), return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}  # Ensure inputs are on the same device as image_tensor
+        # Determine the smaller dimension to decide the split direction
+        _, H, W = image_tensor.shape
+        if W > H:
+            # Width is greater, split vertically
+            min_side = H
+            squares = [image_tensor[:, :, :min_side], image_tensor[:, :, W - min_side : W]]
+        else:
+            # Height is greater or equal, split horizontally
+            min_side = W
+            squares = [image_tensor[:, :min_side, :], image_tensor[:, H - min_side : H, :]]
 
+        depth_squares = []
         with torch.no_grad():
-            outputs = model_cache["model"](**inputs)
-            predicted_depth = outputs.predicted_depth  # Shape: (1, H, W)
+            for square in squares:
+                inputs = model_cache["processor"](images=square.to(device), return_tensors="pt")
+                inputs = {k: v.to(device) for k, v in inputs.items()}  # Ensure inputs are on the same device as image_tensor
+                outputs = model_cache["model"](**inputs)
+                predicted_depth = outputs.predicted_depth  # Shape: (1, H, W)
+                depth_squares.append(predicted_depth)
+
+        # Merge by creating a mask that blends the overlapping areas
+        mask = torch.zeros_like(depth_squares[0])
+        if W > H:
+            # Vertical split mask
+            mask[:, :, :min_side] = 1
+            mask[:, :, W - min_side : W] += 0.5  # Overlap region
+        else:
+            # Horizontal split mask
+            mask[:, :min_side, :] = 1
+            mask[:, H - min_side : H, :] += 0.5  # Overlap region
+
+        merged_depth = depth_squares[0] * mask + depth_squares[1] * (1 - mask)
 
         # Cache the result
         os.makedirs(cache_dir, exist_ok=True)
-        torch.save(predicted_depth, cache_path)
+        torch.save(merged_depth, cache_path)
         print("Saved depth tensor to cache.")
 
-    return predicted_depth
+    return merged_depth
+
+
+def image_depth_multi_res(image_tensor, cache_dir="cache"):
+    """
+    Estimate depth from an image tensor by processing multiple resolutions, with caching.
+
+    Args:
+    - image_tensor (torch.Tensor): A tensor representation of the image of shape (3, H, W).
+
+    Returns:
+    - torch.Tensor: Depth map tensor of shape (1, H, W).
+    """
+    initialize_model()  # Ensure model and processor are initialized and cached
+
+    # Ensure input is a tensor on the correct device
+    if not isinstance(image_tensor, torch.Tensor):
+        raise TypeError("Input must be a torch.Tensor")
+
+    # Normalize the tensor to the range [0, 1] if it's not already
+    if image_tensor.min() < 0 or image_tensor.max() > 1:
+        image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min())
+
+    device = image_tensor.device  # Use the device of the input image tensor
+
+    # Define tile size and overlap
+    tile_size = 200
+    overlap = 100
+    stride = tile_size - overlap
+
+    # Calculate number of tiles needed along each dimension
+    _, H, W = image_tensor.shape
+    num_tiles_h = (H - overlap) // stride + 1
+    num_tiles_w = (W - overlap) // stride + 1
+
+    # Initialize full resolution depth map
+    full_depth_map = torch.zeros((1, H, W), device=device)
+
+    # Process each tile
+    for i in range(num_tiles_h):
+        for j in range(num_tiles_w):
+            # Calculate tile coordinates
+            start_h = i * stride
+            end_h = start_h + tile_size
+            start_w = j * stride
+            end_w = start_w + tile_size
+
+            # Extract tile
+            tile = image_tensor[:, start_h:end_h, start_w:end_w]
+
+            # Process tile
+            tile_depth = image_depth(tile, cache_dir)  # Recursive call to process each tile
+
+            # Place tile depth in full depth map
+            full_depth_map[:, start_h:end_h, start_w:end_w] += tile_depth
+
+    # Normalize overlapping regions by the number of tiles contributing to each pixel
+    normalization_mask = torch.zeros((1, H, W), device=device)
+    for i in range(num_tiles_h):
+        for j in range(num_tiles_w):
+            start_h = i * stride
+            end_h = start_h + tile_size
+            start_w = j * stride
+            end_w = start_w + tile_size
+            normalization_mask[:, start_h:end_h, start_w:end_w] += 1
+
+    full_depth_map /= normalization_mask
+
+    return full_depth_map
 
 
 # Accepts a list of frames and stores the result in a cache
