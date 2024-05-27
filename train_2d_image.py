@@ -4,6 +4,7 @@ from PIL import Image
 import numpy as np
 import torch
 import subprocess
+from einops import rearrange, einsum
 
 from transformers_model_code import TransformerSeq2SeqBasic, SphericalEmbedding
 
@@ -56,14 +57,19 @@ def train_image(image: Image.Image):
     print("pos_embds shape", pos_embds.shape)
 
     patch_size = 8 
-    # Transform into a flat list of patchs (H, W, 2) => [(HxW)/ patch_size, patch_size, 2]
-    seq_len = (img_width // patch_size) * (img_height // patch_size)
-    patched_pos_embds = pos_embds.reshape(seq_len, patch_size, patch_size, 2)
-    flattened_patched_pos_embds = patched_pos_embds.reshape(-1, 2)
-    # print both
-    print("patched_pos_embds shape", patched_pos_embds.shape)
-    print("flattened_patched_pos_embds shape", flattened_patched_pos_embds.shape)
 
+    # HxWx2 => (H/patch_size)x(W/patch_size)x(patch_size)x(patch_size)x2
+    # Reshape to group into patches of size 8x8 while maintaining the 2 feature dimensions
+    patched_pos_embds = rearrange(pos_embds, '(h p1) (w p2) c -> (h w) p1 p2 c', p1=patch_size, p2=patch_size)  # HxWx2 -> (H/8)x(W/8)x8x8x2
+
+    # (H/patch_size)x(W/patch_size)x(patch_size)x(patch_size)x2 => (Seq_len, patch_size**2, feature_dim)
+    # Flatten the patches into a sequence while keeping each patch's structure and feature dimension
+    seq_len = (img_width // patch_size) * (img_height // patch_size)
+    flattened_patched_pos_embds = rearrange(patched_pos_embds, '(n h w) p1 p2 c -> (n h w) (p1 p2) c', n=seq_len)  # (H/8)x(W/8)x8x8x2 -> (Seq_len, 8x8, 2)
+
+    # print both
+    print("patched_pos_embds shape", patched_pos_embds.shape)  # Expect: (Seq_len, 8, 8, 2)
+    print("flattened_patched_pos_embds shape", flattened_patched_pos_embds.shape)  # Expect: (Seq_len, 64, 2)
 
 
     # set as 0 for now
@@ -84,7 +90,6 @@ def train_image(image: Image.Image):
 
             print("pos_emb_shape", pos_embds.shape)
             print("depths_v_shape", depths_v.shape)
-            from einops import rearrange, einsum
 
             depths_v = rearrange(depths_v, "b -> b 1")
 
