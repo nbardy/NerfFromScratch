@@ -1,6 +1,8 @@
 import torch
 import triton
 
+import triton.language as tl
+
 
 @triton.jit
 def _fused_moe_triton_kernel(

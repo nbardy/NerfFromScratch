@@ -156,16 +156,16 @@ class TransformerEncoder(nn.Module):
     def __init__(self, input_dim, output_dim, model_depth=1, embedding_class=AngleEmbedding):
         super().__init__()
         embedding_depth = 8
-        projection_dim = 8
+        inner_dim = 8
         heads = 8
         model_depth = 1
 
         self.input_dim = input_dim
 
         # fmt: off
-        self.embedding          = embedding_class(input_dim=input_dim, dim=projection_dim, depth=embedding_depth)
-        self.transformer_blocks = nn.ModuleList([TransformerBlock(projection_dim, heads) for _ in range(model_depth)])
-        self.final_projection   = nn.Linear(projection_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
+        self.embedding          = embedding_class(input_dim=input_dim, dim=inner_dim, depth=embedding_depth)
+        self.transformer_blocks = nn.ModuleList([TransformerBlock(inner_dim, heads) for _ in range(model_depth)])
+        self.final_projection   = nn.Linear(inner_dim * embedding_depth, output_dim)  # Flatten Bx(D*P) => BxO
 
     def forward(self, x, embedding_args={}):
         x = self.embedding(x, **embedding_args)
@@ -175,6 +175,61 @@ class TransformerEncoder(nn.Module):
 
         x = rearrange(x, "b d p -> b (d p)")
         x = self.final_projection(x)
+        return x
+
+# Transformer Seq2Seq
+class TransformerSeq2SeqBasic(nn.Module):
+    def __init__(self, input_dim, inner_dim=64, heads=8, model_depth=8):
+        super().__init__()
+
+        # Project to inner_dim size from input_dim
+        self.embedding_projection_linear = nn.Linear(input_dim, inner_dim)
+        self.transformer_encoder_layers = nn.ModuleList([TransformerBlock(inner_dim, heads) for _ in range(model_depth)])
+        self.output_projection_linear = nn.Linear(inner_dim, input_dim)
+
+
+    def forward(self, x):
+        x = self.embedding_projection_linear(x)
+        for layer in self.transformer_encoder_layers:
+            x = layer(x)
+        return self.output_projection_linear(x)
+
+class TransformerSeq2SeqMixedMemory(nn.Module):
+    def __init__(self, input_dim, inner_dim=64, heads=8, model_depth=8, depth_window_scale=1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.inner_dim = inner_dim
+        self.heads = heads
+        self.model_depth = model_depth
+        self.depth_window_scale = depth_window_scale
+        self.seq_length = model_depth // depth_window_scale
+
+        # Ensure that the depth_window_scale divides the model_depth evenly
+        assert model_depth % depth_window_scale == 0, "model_depth must be divisible by depth_window_scale"
+
+        # Project to inner_dim size from input_dim
+        self.embedding_projection_linear = nn.Linear(input_dim, inner_dim)
+        self.transformer_encoder_layers = nn.ModuleList([TransformerBlock(inner_dim, heads) for _ in range(model_depth)])
+        self.output_projection_linear = nn.Linear(inner_dim, input_dim)
+        # [Change] Define memory_registers with dimensions [seq_length, inner_dim, input_dim]
+        self.memory_registers = [nn.Parameter(torch.rand(self.seq_length, inner_dim, input_dim)) for _ in range(self.model_depth)]
+
+    def forward(self, x):
+        x = self.embedding_projection_linear(x)
+        # [Change] Process the sequence with transformer blocks
+        for i, layer in enumerate(self.transformer_encoder_layers):
+            x = layer(x)
+            memory_x = self.memory_registers[i]
+            # Add memory to the last N values of seq where N is the depth_window_scale
+            x_slice = x[:-self.depth_window_scale]
+            x_slice += memory_x
+            # insert
+            x[:-self.depth_window_scale] = x_slice
+            # Shift and roll ( blended residuals)
+            x = torch.roll(x, 1, dims=1)
+
+
+        x = self.output_projection_linear(x)
         return x
 
 
@@ -213,9 +268,16 @@ def test_angle_embedding():
     print(debug_str)
     assert out.shape == (10, 8, 8), debug_str
 
+def test_all_seq_to_seq():
+    model = TransformerSeq2SeqBasic(input_dim=10, inner_dim=8, heads=8, model_depth=8)
+    x = torch.randn(10, 10, 10)  # BxIxI
+    out = model(x)
+    assert out.shape == (10, 10, 10)
+
 
 if __name__ == "__main__":
     test_spherical_embedding()
     test_angle_embedding()
     test_tiny_spherical_transformer()
     test_space_time_encoder()
+    test_all_seq_to_seq()

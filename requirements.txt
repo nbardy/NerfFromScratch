@@ -1,2 +1,7 @@
+pillow
+requests
 simple_parsing
-torchmetrics>=1.4.0
+torchmetrics
+numpy
+wandb
+einops
