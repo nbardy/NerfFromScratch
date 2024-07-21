@@ -1,6 +1,16 @@
 import torch
+from transformers import AutoProcessor, AutoModel
+from PIL import Image
+import requests
 
+# Global cache for models
+siglip_model = None
+siglip_processor = None
+dinov2_model = None
+dinov2_processor = None
 
+def load_siglip_model():
+    global siglip_model, siglip_processor
 def dino_pixel_features(image):
     # TODO: Impliment deno model
     return False

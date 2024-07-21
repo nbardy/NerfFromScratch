@@ -62,6 +62,7 @@ def get_depth(img: Image.Image):
     # Load the output depth image and convert to tensor
     output_path = base_path + "outputs_midas/input_image_depth.png"
     depth_image = Image.open(output_path)
+    import numpy as np
     depth_tensor = torch.from_numpy(np.array(depth_image)).unsqueeze(0)  # Add channel dimension
 
     return depth_tensor

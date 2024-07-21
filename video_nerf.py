@@ -13,8 +13,8 @@ import kornia
 
 from models import get_model
 from utils import get_default_device, histo_tensor
-from preprocess import blur_scores, deblur_video_vrt, load_video, get_image_feature_difference_scores
-from peft import inject_adapter_in_model, LoraConfig
+from preprocess import compute_blur_scores, deblur_video_vrt, load_video, get_image_feature_difference_scores
+# from peft import inject_adapter_in_model, LoraConfig
 
 from depth import video_depth
 from style import embed_text, embed_image
@@ -298,6 +298,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     # for input in zip([flat_x, flat_times, flat_origin], ["flat_x", "flat_times", "flat_origin"]):
     #     histo_tensor(input[1], input[0])
     # Print the hist
+    print("Shapes", flat_x.shape, flat_times.shape, flat_origin.shape)
     rgba, features = nerf_model(point=flat_x, time=flat_times, origin=flat_origin)
     # check for nan if nan print tensor
 
@@ -319,7 +320,9 @@ def render_rays(nerf_model, ray_origins, ray_directions, times, hn=0, hf=0.5, nb
     # Compute probability distribution for entropy regularization
     #
     # Alpha total must be above a certain value, this minimizes the impact of the loss
-    # on empty space
+    # on empty spac4
+    g
+
     if args.enable_entropy_loss:
         prob = alpha / (alpha.sum(1).unsqueeze(1) + 1e-10)
         T = args.entropy_threshold
@@ -644,8 +647,11 @@ def train_video(
     # 1/4th of the original size int math
     import math
 
-    factor = 8
-    small_image_size = [math.ceil(video_frame_shape[0] / factor), math.ceil(video_frame_shape[1] / factor)]
+    factor_small = 8
+    small_image_size = [math.ceil(video_frame_shape[0] / factor_small), math.ceil(video_frame_shape[1] / factor_small)]
+
+    factor_med = 4
+    medium_image_size = [math.ceil(video_frame_shape[0] / factor_med), math.ceil(video_frame_shape[1] / factor_med)]
 
     scene_function.to(device)
     camera_position.to(device)
@@ -707,7 +713,6 @@ def train_video(
             camera_poses = rearrange(camera_poses, "c w h -> w h c")
             camera_rays = rearrange(camera_rays, "c w h -> w h c")
 
-            raise Exception("Not implemented: TODO! Add depth map support, first support multi resolution")
             frame_depth_estimate = depth_maps[frame_index].to(device)  # 1xHxW
 
             features = get_feature_map_fake(frame)
@@ -795,6 +800,8 @@ def train_video(
             depth_loss = args.scale_depth_loss * depth_loss_fn(depth, batch_depth)
             total_loss += depth_loss
             log_data["depth_loss"] = depth_loss.item()
+            log_data["depth_loss/depth_gt(histo)"] = depth
+            log_data["depth_loss/depth_predict(histo)"] = batch_depth
 
         if args.add_feature_mapping:
             projected_features = project_feature_to_clip(generated_features)
@@ -812,10 +819,10 @@ def train_video(
 
         # Log a small thumbnail always 1/64 size
         if args.should_log_validation_image:
-            log_data.update(log_image(scene_function, video_frames, camera_position, small_image_size, frame_count, prefix="small_image"))
+            log_data.update(log_image(scene_function, video_frames, camera_position, small_image_size, frame_count, prefix="small_image(val)"))
 
         if epoch != 0 and epoch % args.validation_steps == 0 and args.should_log_validation_image:
-            log_data.update(log_image(scene_function, video_frames, camera_position, size, frame_count))
+            log_data.update(log_image(scene_function, video_frames, camera_position, medium_image_size, frame_count), prefix="medium_image(val)")
 
         log_data["total_loss"] = total_loss.item()
         log_data["learning_rate"] = scheduler.get_last_lr()[0]
@@ -934,12 +941,17 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
     gt_scaled = (gt_frame * 255).clamp(0, 255).to(torch.uint8)  # Perform scaling and clamping on GPU
     gt_frame_pil = Image.fromarray(gt_scaled.cpu().numpy(), "RGB")  # Convert to CPU for PIL handling
 
-    depth_scaled = depth / (torch.max(depth) + 1e-10)  # Normalize depth to 0-1 with epsilon for safety
+    depth_normalized = depth / (torch.max(depth) + 1e-10)  # Normalize depth to 0-1 with epsilon for safety
+    # Rescale to (0, 255)
+    depth_scaled = (depth_normalized * 255).clamp(0, 255).to(torch.uint8)
     depth_image = depth_scaled.detach().clamp(0, 255).to(torch.uint8).squeeze()  # Perform clamping on GPU and ensure sigma is 2D
     depth_pil = Image.fromarray(depth_image.cpu().numpy(), "L")  # Convert to CPU for PIL handling
 
-    disp = disp.detach().clamp(0, 255).to(torch.uint8).squeeze()  # Perform clamping on GPU and ensure sigma is 2D
-    disp_pil = Image.fromarray(disp.cpu().numpy(), "L")  # Convert to CPU for PIL handling
+    # Rescale disp to (0, 255)
+    disp_normalized = disp / (torch.max(disp) + 1e-10)  # Normalize depth to 0-1 with epsilon for safety
+    disp_scaled = (disp_normalized * 255).clamp(0, 255).to(torch.uint8)
+    disp_image = disp_scaled.detach().clamp(0, 255).to(torch.uint8).squeeze()  # Perform clamping on GPU and ensure sigma is 2D
+    disp_pil = Image.fromarray(disp_image.cpu().numpy(), "L")  # Convert to CPU for PIL handling
 
     if not prefix:
         prefix = ""
@@ -948,11 +960,13 @@ def log_image(scene_function, video_frames, camera_position, size, total_frames,
 
     log_data[f"{prefix}predicted"] = wandb.Image(image_pil)
     log_data[f"{prefix}predicted_histo"] = generated_image
-    log_data[f"{prefix}ground truth"] = wandb.Image(gt_frame_pil)
-    log_data[f"{prefix}depth"] = wandb.Image(depth_pil)
+    log_data[f"{prefix}ground truth"] = wandb.Image(gt_frame_pil) # image
+    log_data[f"{prefix}ground truth/scaled(0-1)"] = gt_scaled # histo
+    log_data[f"{prefix}ground truth/scaled(0-255)"] = gt_scaled # histo
+    log_data[f"{prefix}depth/scaled(0-1)"] = wandb.Image(depth_pil)
     log_data[f"{prefix}depth_histo"] = depth_image
     log_data[f"{prefix}depth_scaled"] = depth_scaled
-    log_data[f"{prefix}disp"] = wandb.Image(disp_pil)
+    log_data[f"{prefix}disp/scaled(0-1)"] = wandb.Image(disp_pil)
     log_data[f"{prefix}disp_histo"] = disp
 
     return log_data
@@ -1124,7 +1138,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale_depth_loss",
     type=float,
-    default=0.0,
+    default=0.4,
     help="Scaling factor for depth loss.",
 )
 parser.add_argument(
@@ -1192,15 +1206,15 @@ if __name__ == "__main__":
         deblurred_video = deblur_video_vrt(video_frames)
 
     if args.weight_blur_and_difference:
-        blur_scores = blur_scores(video_frames)
-        blur_scores = blur_scores.to(device)
+        scores = compute_blur_scores(video_frames)
+        scores = scores.to(device)
         # fp16
-        blur_scores = blur_scores.half()
+        scores = scores.half()
 
         differences = get_image_feature_difference_scores(video_frames)
         # else none
     else:
-        blur_scores = None
+        scores = None
         differences = None
 
     # Launch training with deblurred video if enabled, otherwise use original video path
@@ -1224,7 +1238,7 @@ if __name__ == "__main__":
         n_points=args.n_points,
         n_frames=args.n_frames,
         max_frames=args.max_frames,
-        blur_scores=blur_scores,
+        blur_scores=scores,
         differences=differences,
         args=args,  # Pass args to access enable_entropy_loss flag
     )

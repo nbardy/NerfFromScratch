@@ -420,11 +420,13 @@ class MoeLayer(nn.Module):
         if gate_inputs is None:
             gate_inputs = inputs
         gate_logits = self.gate(gate_inputs)
+        # pool the gate logits per token
+        gate_logits = gate_logits.mean(dim=1)
 
         # debug_tensor("gate_logits", gate_logits)
-        weights, selected_experts = torch.topk(gate_logits, self.args.num_selected_experts)
+        weights, selected_experts = torch.topk(gate_logits, self.args.num_selected_experts, dim=1)
         # debug_tensor("weights", weights)
-        weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
+        weights = F.softmax(weights, dtype=torch.float).to(inputs.dtype)
         results = None
 
         # debug_tensor("selected experts", selected_experts)
@@ -440,16 +442,25 @@ class MoeLayer(nn.Module):
 
             results = self.pool(results, batch_idx, expert_result, inputs.shape[0])
 
+        print("inputs -", inputs.shape)
+        print("selected_experts - ", selected_experts.shape)
+        print("weights - ", weights.shape)
         # Process selected experts
         for i, expert in enumerate(self.specialist_experts):
-            batch_idx, nth_expert = torch.where(selected_experts == i - self.args.num_default_experts)
-            # print("=== Index i ==== (", i, ")")
-            # debug_tensor("calling selected expert", torch.tensor([i]))
-            # debug_tensor("batch_idx", batch_idx)
-            # debug_tensor("nth_expert", nth_expert)
-            # debug_tensor("inputs", inputs)
-            if batch_idx.shape[0] > 0:
-                results = self.pool(results, batch_idx, weights[batch_idx, nth_expert, None] * expert(inputs[batch_idx]), inputs.shape[0])
+            condition = selected_experts == (i - self.args.num_default_experts)
+            indices = torch.where(condition)
+            if indices[0].shape[0] > 0:  # Check if there are any true values
+                batch_idx = indices[0]
+                nth_expert = indices[1]
+                expert_inputs = inputs[batch_idx]  # BxCxWxH
+                expert_outputs = expert(expert_inputs)  # BxCxWxH
+                print("== shapes debug ==")
+                print("batch_idx     :", batch_idx.shape)
+                print("nth_expert    :", nth_expert.shape)
+                print("expert_outputs:", expert_outputs.shape)
+                print("weights       :", weights.shape)
+                weighted_expert_outputs = weights[batch_idx, nth_expert, None] * expert_outputs  # BxCxWxH
+                results = self.pool(results, batch_idx, weighted_expert_outputs, inputs.shape[0])  # BxCxWxH
 
         return results
 

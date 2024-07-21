@@ -83,7 +83,7 @@ def generate_hash_and_cache_path(video_frames: torch.Tensor, key: str) -> Path:
 # and attempts to load from cache if available. Returns a tensor of scores.
 
 
-def blur_scores(video_frames: List[torch.Tensor], cache_key=None) -> torch.Tensor:
+def compute_blur_scores(video_frames: List[torch.Tensor], cache_key=None) -> torch.Tensor:
     assert_video_shape(video_frames)
     print(type(video_frames))
     # print ype of first frame
@@ -102,6 +102,11 @@ def blur_scores(video_frames: List[torch.Tensor], cache_key=None) -> torch.Tenso
         )  # Compute and convert list to tensor
 
         # Step 4: Save computed blur scores to cache
+        # mkdir
+        print("[info] Blur cache_path", cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+
         torch.save(blur_scores_tensor, cache_path)  # Save scores to cache for future use
 
     return blur_scores_tensor

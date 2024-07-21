@@ -70,13 +70,27 @@ class GQAAttention(torch.nn.Module):
         return attn_output, None ,
 
 
-# A vanilla multi-head self-attention layer with a projection at the end.
+import torch
+
 class SelfAttention(nn.Module):
-    def __init__(self, bias=False, heads=8, embed_dim=64):
+    def __init__(self, bias=False, heads=8, embed_dim=64, use_memory_efficient_attention=True):
         super().__init__()
-        assert embed_dim % heads == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
+        assert embed_dim % heads == 0, f"Embed: {embed_dim} is not divisible by heads: {heads}"
+        self.use_memory_efficient_attention = use_memory_efficient_attention
+        if self.use_memory_efficient_attention:
+            from memory_efficient_attention_pytorch import Attention
+
+            self.attn = Attention(
+                dim=embed_dim,
+                dim_head=embed_dim // heads,  # dimension per head
+                heads=heads,                  # number of attention heads
+                causal=True,                  # autoregressive or not
+                memory_efficient=True,        # whether to use memory efficient attention
+                q_bucket_size=embed_dim*2,      # bucket size along queries dimension set to embed_dim
+                k_bucket_size=embed_dim*4       # bucket size along key / values dimension set to embed_dim
+            )
+        else:
+            self.c_attn = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         # output projection
         self.c_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         # regularization
@@ -85,18 +99,17 @@ class SelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        if self.use_memory_efficient_attention:
+            y = self.attn(x)  # (B, T, C)
+        else:
+            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = torch.nn.functional.softmax(att, dim=-1)
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.c_proj(y)
@@ -110,8 +123,6 @@ def test_attention():
     layer = SelfAttention(embed_dim=hidden_size, bias=False)
     x = torch.randn(batch_size, seq_len, hidden_size)
     y = layer(x)
-    print("x:", "shape:", x.shape)  # BxSeqLenxHidden
-    print("y:", "shape:", y.shape)  # BxSeqLenxHidden
 
 
 test_attention()
