@@ -1,6 +1,9 @@
 ## Nerf From Scratch
 
-This started as me writing a nerf implimentation from scratch to learn the paper. Eventaully this evolved into adding a set of papers together from modern NERFs into a single repo since I could not find a good easy to use nerf repo that had quality style transfer + works on iphone mp4s
+A bunch of code to practice implimeting NERF papers from scratch and learn their details
+
+(NOTE: This readme is no longer developed, Pushing up all existing changes in case there is some learnings to be shared, but mostly thi was a scratch pad)
+
 
 #### Goal:
 
